@@ -1,0 +1,4 @@
+streamlit
+google-genai
+google-cloud-bigquery
+PyYAML

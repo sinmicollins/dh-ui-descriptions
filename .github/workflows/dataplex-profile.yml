@@ -1,0 +1,79 @@
+# Copyright 2026 Google LLC
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+
+#     https://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+# .github/workflows/dataplex-profile.yml
+name: Run GCP Dataplex Data Profiling
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'data-profile-spec.yaml'
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: 'demo1-311322' 
+  LOCATION: 'us-central1'
+  DATASCAN_ID: 'my-demo-profile-scan'
+  TARGET_RESOURCE: '//bigquery.googleapis.com/projects/demo1-311322/datasets/mobile_data/tables/work_orders'
+  WORKLOAD_IDENTITY_PROVIDER: 'projects/466544598118/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+  SERVICE_ACCOUNT: 'dataplex-demo1-311322@demo1-311322.iam.gserviceaccount.com'
+
+jobs:
+  run-data-profiling:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      id-token: 'write' 
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4.2.2
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Deploy / Update Data Profile Scan
+        run: |
+          if gcloud dataplex datascans describe ${{ env.DATASCAN_ID }} --location=${{ env.LOCATION }} --project=${{ env.PROJECT_ID }} >/dev/null 2>&1; then
+            echo "Scan exists. Updating scan config..."
+            gcloud dataplex datascans update data-profile ${{ env.DATASCAN_ID }} \
+              --location=${{ env.LOCATION }} \
+              --project=${{ env.PROJECT_ID }} \
+              --data-profile-spec-file=data-profile-spec.yaml \
+              --schedule="0 2 * * *"
+          else
+            echo "Scan does not exist. Creating a new data-profile scan..."
+            gcloud dataplex datascans create data-profile ${{ env.DATASCAN_ID }} \
+              --location=${{ env.LOCATION }} \
+              --project=${{ env.PROJECT_ID }} \
+              --data-source-resource="${{ env.TARGET_RESOURCE }}" \
+              --data-profile-spec-file=data-profile-spec.yaml \
+              --service-account="${{ env.SERVICE_ACCOUNT }}" \
+              --schedule="0 2 * * *"
+          fi
+
+      - name: Trigger and Run Scan Job
+        run: |
+          gcloud dataplex datascans run ${{ env.DATASCAN_ID }} \
+            --location=${{ env.LOCATION }} \
+            --project=${{ env.PROJECT_ID }}

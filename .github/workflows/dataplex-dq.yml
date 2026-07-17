@@ -1,0 +1,90 @@
+# Copyright 2026 Google LLC
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+
+#     https://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Run GCP Dataplex Data Quality Scans
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'data-quality-spec.yaml'
+      - 'data-rules-aspects.yaml'
+  workflow_dispatch: # Allows manual pipeline run from GitHub
+env:
+  PROJECT_ID: 'demo1-311322'
+  LOCATION: 'us-central1'
+  DATASCAN_ID: 'work-orders-dq-scan'
+  TARGET_RESOURCE: '//bigquery.googleapis.com/projects/demo1-311322/datasets/mobile_data/tables/work_orders'
+  WORKLOAD_IDENTITY_PROVIDER: 'projects/466544598118/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+  SERVICE_ACCOUNT: 'dataplex-demo1-311322@demo1-311322.iam.gserviceaccount.com'
+
+jobs:
+  run-data-quality:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4.2.2
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Deploy Data Rules Aspects to Catalog Entry
+        run: |
+          ENTRY_ID=$(echo "${{ env.TARGET_RESOURCE }}" | sed 's|//||')
+          echo "Syncing rules to Catalog Entry '${ENTRY_ID}'..."
+          gcloud dataplex entries update-aspects "$ENTRY_ID" \
+            --project=${{ env.PROJECT_ID }} \
+            --location=${{ env.LOCATION }} \
+            --entry-group="@bigquery" \
+            --aspects="data-rules-aspects.yaml"
+
+      - name: Deploy / Update Data Quality Scan
+        run: |
+          echo "Checking if DQ scan '${{ env.DATASCAN_ID }}' exists..."
+          
+          if gcloud dataplex datascans describe ${{ env.DATASCAN_ID }} --location=${{ env.LOCATION }} --project=${{ env.PROJECT_ID }} >/dev/null 2>&1; then
+            echo "DQ Scan exists. Syncing/Updating rules configuration..."
+            gcloud dataplex datascans update data-quality ${{ env.DATASCAN_ID }} \
+              --location=${{ env.LOCATION }} \
+              --project=${{ env.PROJECT_ID }} \
+              --data-quality-spec-file=data-quality-spec.yaml \
+              --schedule="0 2 * * *"
+          else
+            echo "DQ Scan does not exist. Registering a new data-quality scan..."
+            gcloud dataplex datascans create data-quality ${{ env.DATASCAN_ID }} \
+              --location=${{ env.LOCATION }} \
+              --project=${{ env.PROJECT_ID }} \
+              --data-source-resource="${{ env.TARGET_RESOURCE }}" \
+              --data-quality-spec-file=data-quality-spec.yaml \
+              --service-account="${{ env.SERVICE_ACCOUNT }}" \
+              --schedule="0 2 * * *"
+          fi
+
+      - name: Trigger Data Quality Check
+        run: |
+          echo "Executing quality check..."
+          gcloud dataplex datascans run ${{ env.DATASCAN_ID }} \
+            --location=${{ env.LOCATION }} \
+            --project=${{ env.PROJECT_ID }}
