@@ -309,6 +309,7 @@ output_filename = f"{file_prefix}{source_dataset_id}.yaml"
 
 
 # Initialize BQ Client
+bq_client = None
 try:
     bq_client = bigquery.Client(project=project_id, location=bq_location)
 except Exception as e:
@@ -342,21 +343,24 @@ else:
         "INFORMATION_SCHEMA.TABLES."
     )
     if st.button("Fetch Tables from INFORMATION_SCHEMA"):
-        try:
-            # Identifiers can't be parameterized; source_project_id is derived from a
-            # fixed mapping and source_dataset_id is a controlled config value.
-            query = f"""
-            SELECT table_name
-            FROM `{source_project_id}.{source_dataset_id}.INFORMATION_SCHEMA.TABLES`
-            WHERE table_type = 'BASE TABLE'
-            ORDER BY table_name
-            """
-            query_job = bq_client.query(query)
-            table_names = [row["table_name"] for row in query_job]
-            st.session_state["fetched_tables"] = table_names
-            st.success(f"Found {len(table_names)} tables: {', '.join(table_names)}")
-        except Exception as e:
-            st.error(f"Error retrieving tables: {e}")
+        if bq_client is None:
+            st.error("BigQuery client failed to initialize. Cannot fetch tables.")
+        else:
+            try:
+                # Identifiers can't be parameterized; source_project_id is derived from a
+                # fixed mapping and source_dataset_id is a controlled config value.
+                query = f"""
+                SELECT table_name
+                FROM `{source_project_id}.{source_dataset_id}.INFORMATION_SCHEMA.TABLES`
+                WHERE table_type = 'BASE TABLE'
+                ORDER BY table_name
+                """
+                query_job = bq_client.query(query)
+                table_names = [row["table_name"] for row in query_job]
+                st.session_state["fetched_tables"] = table_names
+                st.success(f"Found {len(table_names)} tables: {', '.join(table_names)}")
+            except Exception as e:
+                st.error(f"Error retrieving tables: {e}")
     # Persist a fetched list across reruns so downstream steps still see it.
     if not table_names and st.session_state.get("fetched_tables"):
         table_names = st.session_state["fetched_tables"]
@@ -366,6 +370,8 @@ else:
 # ---------------------------------------------------------
 def get_column_profiles(tables):
     """Retrieve latest profiling metrics for target tables from BigQuery"""
+    if bq_client is None:
+        raise RuntimeError("BigQuery client is not initialized.")
     query = f"""
     WITH RankedProfiles AS (
       SELECT
@@ -400,9 +406,11 @@ def get_column_profiles(tables):
     results = []
     for row in query_job:
         # Format top_n records to list of dicts
+        row_dict = dict(row)
         top_n_val = []
-        if row["top_n"]:
-            for item in row["top_n"]:
+        top_n_data = row_dict.get("top_n")
+        if isinstance(top_n_data, list):
+            for item in top_n_data:
                 top_n_val.append({
                     "value": item.get("value"),
                     "count": item.get("count"),
@@ -492,7 +500,7 @@ def _finalize_scan_id(candidate: str) -> str:
     return re.sub(r"[^a-z0-9_]", "_", candidate.lower())
 
 
-def build_scan_id(prefix: str, dataset: str, table: str, abbrev: dict = None,
+def build_scan_id(prefix: str, dataset: str, table: str, abbrev: dict | None = None,
                   max_len: int = MAX_SCAN_ID_LEN) -> str:
     """Deterministic scan/job id: <prefix>_<dataset>_<stripped_table>.
 
