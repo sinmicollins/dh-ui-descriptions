@@ -13,8 +13,12 @@ By leveraging metadata aspects bound directly to Catalog entry schemas instead o
 │   └── workflows/
 │       ├── dataplex-dq.yml      # CI/CD: Deploys aspects & schedules daily quality scans
 │       └── dataplex-profile.yml # CI/CD: Schedules daily data profiling scans
-├── dataplex-dq-agent/           # Streamlit-based GenAI rule generator app
-│   ├── app.py                   # Main agent UI with Human-in-the-loop validation
+├── dataplex-dq-agent/           # Streamlit-based GenAI scan generator apps
+│   ├── data_quality_app.py      # DQ scan (dataplex-dq) generator with Human-in-the-loop validation
+│   ├── data_profiling_app.py    # Data profiling scan (dataplex-dp) generator
+│   ├── dq_common.py             # Shared chassis: FuelIX access, scan ids, YAML quoting, UI blocks
+│   ├── benchmarks/              # Fixtures, golden rule sets, and benchmark results/report
+│   ├── abbreviations.csv        # Token abbreviations used to fit scan ids in 36 chars
 │   └── requirements.txt         # App package dependencies
 ├── pulumi-approach/             # Infrastructure-as-Code deployment project
 │   ├── __main__.py              # Main Pulumi script (loads rules spec dynamically)
@@ -32,7 +36,7 @@ By leveraging metadata aspects bound directly to Catalog entry schemas instead o
 ## 🚀 Workflows & Getting Started
 
 ### Workflow 1: Generate Rules Specs via the GenAI Agent
-The **Dataplex Auto-DQ Spec Generator Agent** is a Streamlit app that reads historical column profiling metrics directly from BigQuery, uses **Gemini 3.5 Flash** (via the `google-genai` SDK) to propose rule configurations, accepts human feedback/spreadsheets, and generates your YAML aspects.
+The **Dataplex Auto-DQ Spec Generator Agent** is a Streamlit app that reads historical column profiling metrics directly from BigQuery, uses an LLM via the **FuelIX gateway** (model picker in the sidebar; default `wasikan-qwen-3-next-80b`) to propose rule configurations, accepts human feedback/spreadsheets, and generates your YAML aspects.
 
 #### Setup & Launch:
 ```bash
@@ -40,7 +44,8 @@ cd dataplex-dq-agent
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-streamlit run app.py
+streamlit run data_quality_app.py     # DQ rules/scans
+streamlit run data_profiling_app.py   # data profiling scans
 ```
 * **Step 1: Generate Action Plan**: Queries BigQuery profiling tables and outputs suggested rules with clear statistical justifications.
 * **Step 2: Human-in-the-Loop Feedback**: Review suggestions, upload logic sheets (PDF/CSV/Excel/TXT), type custom overrides, and output the final `data-rules-aspects.yaml` file.

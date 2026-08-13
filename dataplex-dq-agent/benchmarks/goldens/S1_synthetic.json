@@ -1,0 +1,15 @@
+{
+  "note": "Expected (column, expectation_type) pairs per table. '__table__' marks table-level rules. Coverage F1 is scored against these.",
+  "bq_acct": [
+    ["acct_id", "non_null_expectation"],
+    ["acct_id", "uniqueness_expectation"],
+    ["acct_stat_cd", "set_expectation"],
+    ["acct_typ_cd", "set_expectation"],
+    ["bill_cyc_num", "range_expectation"],
+    ["prov_state_cd", "set_expectation"],
+    ["postal_cd", "regex_expectation"],
+    ["credit_score_num", "range_expectation"],
+    ["mthly_chrg_amt", "range_expectation"],
+    ["__table__", "table_condition_expectation"]
+  ]
+}
