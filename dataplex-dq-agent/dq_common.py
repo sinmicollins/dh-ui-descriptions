@@ -13,6 +13,7 @@ FuelIX access, cached BigQuery client, the scan-id build/validate cascade,
 governance-YAML inventory, YAML quoting/repair/validation, and shared UI."""
 import csv
 import glob
+import itertools
 import json
 import math
 import os
@@ -237,6 +238,24 @@ def validate_scan_id(candidate: str, prefix: str, forbidden: set,
     if candidate in forbidden:
         return False, "collides with an existing job id"
     return True, ""
+
+
+def resolve_scan_id(prefix: str, dataset: str, table: str, forbidden: set,
+                    max_len: int = MAX_SCAN_ID_LEN) -> str:
+    """build_scan_id plus guaranteed fallbacks: always returns a valid id that
+    is <= max_len and not in forbidden. Cascade: abbreviation (build_scan_id),
+    then hard truncation, then numeric suffix _2, _3, ..."""
+    candidate = build_scan_id(prefix, dataset, table, max_len=max_len)
+    if len(candidate) > max_len:
+        candidate = candidate[:max_len].rstrip("_-")
+    if candidate in forbidden:
+        for n in itertools.count(2):
+            suffix = f"_{n}"
+            alt = candidate[: max_len - len(suffix)].rstrip("_-") + suffix
+            if alt not in forbidden:
+                candidate = alt
+                break
+    return candidate
 
 
 # ---------------------------------------------------------

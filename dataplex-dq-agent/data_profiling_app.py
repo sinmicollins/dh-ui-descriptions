@@ -25,9 +25,9 @@ from google.cloud import bigquery
 from dq_common import (
     MAX_SCAN_ID_LEN, build_scan_id, call_fuelix, collect_repo_scan_ids,
     get_bq_client, load_yaml, parse_llm_json, read_scans, read_target,
-    render_file_header, render_preview_and_deploy, select_tables, setup_page,
-    show_target, sidebar_connection, sidebar_fuelix, sidebar_scan_settings,
-    validate_scan_id, yaml_quote,
+    render_file_header, render_preview_and_deploy, resolve_scan_id,
+    select_tables, setup_page, show_target, sidebar_connection, sidebar_fuelix,
+    sidebar_scan_settings, validate_scan_id, yaml_quote,
 )
 
 # Audit-column candidates, highest priority first (matched case-insensitively
@@ -289,13 +289,24 @@ if table_names:
                         renames = llm_rename_scan_ids(llm_candidates, forbidden | assigned)
                     except Exception as e:
                         renames = {}
-                        st.warning(f"LLM rename fallback failed ({e}); affected tables stay skipped.")
+                        st.warning(f"LLM rename fallback failed ({e}); "
+                                   "falling back to deterministic ids.")
                 for row in plan:
                     new_id = renames.get(row["table"])
                     if new_id:
                         row["scan_id"], row["status"] = new_id, (
                             "ok (LLM-renamed)" if row["field"] else "needs field — type one below")
                         assigned.add(new_id)
+            # Deterministic retry: any id still invalid after the optional LLM
+            # rename is truncated/suffixed until valid and unique — never skipped.
+            unresolved = {c["table"] for c in llm_candidates}
+            for row in plan:
+                if row["table"] in unresolved and row["status"].startswith("skip:"):
+                    new_id = resolve_scan_id(job_prefix, source_dataset_id,
+                                             row["table"], forbidden | assigned)
+                    row["scan_id"], row["status"] = new_id, (
+                        "ok (auto-renamed)" if row["field"] else "needs field — type one below")
+                    assigned.add(new_id)
             st.session_state["dps_plan"] = plan
         except Exception as e:
             st.error(f"Error analyzing tables: {e}")

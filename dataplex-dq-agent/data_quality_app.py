@@ -25,11 +25,11 @@ import streamlit as st
 from google.cloud import bigquery
 
 from dq_common import (
-    MAX_SCAN_ID_LEN, build_scan_id, call_fuelix, collect_repo_scan_ids,
+    MAX_SCAN_ID_LEN, call_fuelix, collect_repo_scan_ids,
     finite_float, get_bq_client, parse_llm_json, read_target,
-    render_file_header, render_preview_and_deploy, select_tables, setup_page,
-    show_target, sidebar_connection, sidebar_fuelix, sidebar_scan_settings,
-    validate_scan_id, yaml_quote,
+    render_file_header, render_preview_and_deploy, resolve_scan_id,
+    select_tables, setup_page, show_target, sidebar_connection, sidebar_fuelix,
+    sidebar_scan_settings, validate_scan_id, yaml_quote,
 )
 
 # ---------------------------------------------------------
@@ -274,7 +274,8 @@ def build_scan_plan(table_order, rules_by_table):
     plan, blocks, ids = [], [], []
     for table in table_order:
         rules = [r for r in (rules_by_table.get(table) or []) if rule_is_valid(r)]
-        scan_id = build_scan_id(job_prefix, source_dataset_id, table)
+        scan_id = resolve_scan_id(job_prefix, source_dataset_id, table,
+                                  forbidden | set(ids))
         ok, reason = validate_scan_id(scan_id, job_prefix, forbidden | set(ids))
         if ok and not rules:
             ok, reason = False, "no valid rules generated"
