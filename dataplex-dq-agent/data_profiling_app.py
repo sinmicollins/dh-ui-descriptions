@@ -20,24 +20,16 @@ import re
 
 import pandas as pd
 import streamlit as st
-from google.cloud import bigquery
 
 from dq_common import (
     MAX_SCAN_ID_LEN, build_scan_id, call_fuelix, collect_repo_scan_ids,
-    get_bq_client, load_yaml, parse_llm_json, read_scans, read_target,
-    render_file_header, render_preview_and_deploy, resolve_scan_id,
-    select_tables, setup_page, show_target, sidebar_connection, sidebar_fuelix,
-    sidebar_scan_settings, validate_scan_id, yaml_quote,
+    fetch_table_metadata, load_yaml, parse_llm_json,
+    pick_audit_column, read_scans, read_target, render_file_header,
+    render_preview_and_deploy, resolve_scan_id, select_tables, setup_page,
+    show_target, sidebar_connection, sidebar_fuelix, sidebar_scan_settings,
+    validate_scan_id, yaml_quote,
 )
 
-# Audit-column candidates, highest priority first (matched case-insensitively
-# against TIMESTAMP/DATETIME/DATE columns).
-AUDIT_PRIORITY = [
-    "last_updt_ts", "last_update_ts", "src_last_updt_ts", "last_updt_tms",
-    "last_upd_ts", "updt_ts", "update_ts", "last_updt_dt",
-    "create_ts", "created_ts", "creation_ts", "create_dt", "__source_ts_ms",
-]
-AUDIT_REGEX = re.compile(r"(updt|update|audit|source_ts)", re.IGNORECASE)
 # `field` is typed by hand and lands inside a SQL row_filter, so it is held to
 # the BigQuery column-identifier charset before being rendered.
 FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -70,59 +62,8 @@ job_prefix = instance
 output_filename = f"{instance}_dps_{source_dataset_id}.yaml"
 
 # ---------------------------------------------------------
-# Metadata + field resolution
+# Field resolution (metadata helpers shared via dq_common)
 # ---------------------------------------------------------
-@st.cache_data(ttl="15m", show_spinner=False)
-def fetch_table_metadata(project: str, dataset: str, location: str, tables: tuple) -> dict:
-    """{table: {partition_column, partition_column_type, require_partition_filter,
-    temporal_columns}} from INFORMATION_SCHEMA. Both jobs are submitted before
-    either result is read, so they run concurrently."""
-    meta = {t: {"partition_column": "", "partition_column_type": "",
-                "require_partition_filter": False, "temporal_columns": []}
-            for t in tables}
-    client = get_bq_client(project, location)
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ArrayQueryParameter("tables", "STRING", list(tables))])
-    cols_job = client.query(f"""
-    SELECT table_name, column_name, data_type, is_partitioning_column
-    FROM `{project}.{dataset}.INFORMATION_SCHEMA.COLUMNS`
-    WHERE table_name IN UNNEST(@tables)
-      AND (is_partitioning_column = 'YES' OR data_type IN ('TIMESTAMP', 'DATETIME', 'DATE'))
-    ORDER BY table_name, ordinal_position
-    """, job_config=job_config)
-    opts_job = client.query(f"""
-    SELECT table_name, option_value
-    FROM `{project}.{dataset}.INFORMATION_SCHEMA.TABLE_OPTIONS`
-    WHERE option_name = 'require_partition_filter' AND table_name IN UNNEST(@tables)
-    """, job_config=job_config)
-    for row in cols_job:
-        m = meta.get(row["table_name"])
-        if m is None:
-            continue
-        dtype = (row["data_type"] or "").upper()
-        if row["is_partitioning_column"] == "YES":
-            m["partition_column"], m["partition_column_type"] = row["column_name"], dtype
-        if dtype in ("TIMESTAMP", "DATETIME", "DATE"):
-            m["temporal_columns"].append((row["column_name"], dtype))
-    for row in opts_job:
-        m = meta.get(row["table_name"])
-        if m is not None:
-            m["require_partition_filter"] = str(row["option_value"]).strip().lower() == "true"
-    return meta
-
-
-def pick_audit_column(temporal_columns: list) -> str:
-    """First audit-style temporal column: priority list, then regex fallback."""
-    by_lower = {name.lower(): name for name, _typ in temporal_columns}
-    for cand in AUDIT_PRIORITY:
-        if cand in by_lower:
-            return by_lower[cand]
-    for name, _typ in temporal_columns:
-        if AUDIT_REGEX.search(name):
-            return name
-    return ""
-
-
 def resolve_field(meta: dict):
     """The CLI's 6-step cascade. Returns (field, source_note); an empty field
     means manual review (the user can still type one in the editor)."""
@@ -336,7 +277,9 @@ if "dps_plan" in st.session_state:
                 st.info(f"Existing file cron `{existing_cron}` reused for appended scans.")
 
     blocks, scan_ids, skipped = [], [], []
-    for orig, row in zip(plan, edited.to_dict("records")):
+    # pd.DataFrame(...) normalizes data_editor's loosely-typed return (cheap
+    # under copy-on-write) so to_dict(orient=...) type-checks.
+    for orig, row in zip(plan, pd.DataFrame(edited).to_dict(orient="records")):
         field = str(row.get("field") or "").strip()
         if orig["locked"] or orig["status"].startswith("skip:"):
             skipped.append((orig["table"], orig["status"]))

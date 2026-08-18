@@ -3,3 +3,5 @@ google-cloud-bigquery
 PyYAML
 requests
 keyring
+openpyxl
+google-cloud-secret-manager

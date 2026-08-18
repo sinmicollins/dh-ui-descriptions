@@ -96,7 +96,10 @@ def call_fuelix(system_instruction, user_content, api_key, model, temperature=0.
                 and "temperature" in resp.text and "temperature" in payload):
             del payload["temperature"]
             continue
-        resp.raise_for_status()
+        if not resp.ok:
+            # Surface the gateway's own message (context-length, bad model, ...)
+            # instead of raise_for_status()'s body-less HTTPError.
+            raise RuntimeError(f"FuelIX {resp.status_code}: {resp.text[:300]}")
         return resp.json()["choices"][0]["message"]["content"]
     raise RuntimeError("call_fuelix: retry loop exhausted")
 
@@ -156,6 +159,67 @@ def list_dataset_tables(project: str, dataset: str, location: str) -> list:
     WHERE table_type = 'BASE TABLE' ORDER BY table_name
     """
     return [row["table_name"] for row in get_bq_client(project, location).query(query)]
+
+
+# Audit-column candidates, highest priority first (matched case-insensitively
+# against TIMESTAMP/DATETIME/DATE columns).
+AUDIT_PRIORITY = [
+    "last_updt_ts", "last_update_ts", "src_last_updt_ts", "last_updt_tms",
+    "last_upd_ts", "updt_ts", "update_ts", "last_updt_dt",
+    "create_ts", "created_ts", "creation_ts", "create_dt", "__source_ts_ms",
+]
+AUDIT_REGEX = re.compile(r"(updt|update|audit|source_ts)", re.IGNORECASE)
+
+
+@st.cache_data(ttl="15m", show_spinner=False)
+def fetch_table_metadata(project: str, dataset: str, location: str, tables: tuple) -> dict:
+    """{table: {partition_column, partition_column_type, require_partition_filter,
+    temporal_columns}} from INFORMATION_SCHEMA. Both jobs are submitted before
+    either result is read, so they run concurrently."""
+    meta = {t: {"partition_column": "", "partition_column_type": "",
+                "require_partition_filter": False, "temporal_columns": []}
+            for t in tables}
+    client = get_bq_client(project, location)
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("tables", "STRING", list(tables))])
+    cols_job = client.query(f"""
+    SELECT table_name, column_name, data_type, is_partitioning_column
+    FROM `{project}.{dataset}.INFORMATION_SCHEMA.COLUMNS`
+    WHERE table_name IN UNNEST(@tables)
+      AND (is_partitioning_column = 'YES' OR data_type IN ('TIMESTAMP', 'DATETIME', 'DATE'))
+    ORDER BY table_name, ordinal_position
+    """, job_config=job_config)
+    opts_job = client.query(f"""
+    SELECT table_name, option_value
+    FROM `{project}.{dataset}.INFORMATION_SCHEMA.TABLE_OPTIONS`
+    WHERE option_name = 'require_partition_filter' AND table_name IN UNNEST(@tables)
+    """, job_config=job_config)
+    for row in cols_job:
+        m = meta.get(row["table_name"])
+        if m is None:
+            continue
+        dtype = (row["data_type"] or "").upper()
+        if row["is_partitioning_column"] == "YES":
+            m["partition_column"], m["partition_column_type"] = row["column_name"], dtype
+        if dtype in ("TIMESTAMP", "DATETIME", "DATE"):
+            m["temporal_columns"].append((row["column_name"], dtype))
+    for row in opts_job:
+        m = meta.get(row["table_name"])
+        if m is not None:
+            m["require_partition_filter"] = str(row["option_value"]).strip().lower() == "true"
+    return meta
+
+
+def pick_audit_column(temporal_columns: list) -> str:
+    """First audit-style temporal column: priority list, then regex fallback."""
+    by_lower = {name.lower(): name for name, _typ in temporal_columns}
+    for cand in AUDIT_PRIORITY:
+        if cand in by_lower:
+            return by_lower[cand]
+    for name, _typ in temporal_columns:
+        if AUDIT_REGEX.search(name):
+            return name
+    return ""
 
 
 # ---------------------------------------------------------
