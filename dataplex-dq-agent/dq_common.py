@@ -25,9 +25,7 @@ import streamlit as st
 import yaml
 from google.cloud import bigquery
 
-# ---------------------------------------------------------
-# FuelIX (TELUS LLM gateway)
-# ---------------------------------------------------------
+# --- FuelIX (TELUS LLM gateway) ------------------------------------------------
 FUELIX_API_URL = "https://api.fuelix.ai/v1/chat/completions"
 FUELIX_MODELS_URL = "https://api.fuelix.ai/v1/models"
 # Same service/username as the companion CLI so one stored key serves all tools.
@@ -41,9 +39,7 @@ FALLBACK_MODELS = [
     "gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.1-pro-preview",
 ]
 
-# ---------------------------------------------------------
-# Dataplex conventions
-# ---------------------------------------------------------
+# --- Dataplex conventions --------------------------------------------------------
 SOURCE_PROJECTS = {
     ("dv", "dh1"): "cio-datahub-enterprise-dv-e8ff",
     ("dv", "dh2"): "cio-datahub-lake-dv-783079",
@@ -62,9 +58,7 @@ _APP_CSS = """<style>
 </style>"""
 
 
-# ---------------------------------------------------------
-# FuelIX access
-# ---------------------------------------------------------
+# --- FuelIX access -----------------------------------------------------------------
 def get_fuelix_api_key() -> str:
     """Env-var override first, else the OS keyring."""
     env_key = os.environ.get("FUELIX_API_KEY") or os.environ.get("GPT_API_KEY")
@@ -144,9 +138,7 @@ def parse_llm_json(raw: str):
     return None
 
 
-# ---------------------------------------------------------
-# BigQuery (cached)
-# ---------------------------------------------------------
+# --- BigQuery (cached) ----------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_bq_client(project: str, location: str) -> bigquery.Client:
     return bigquery.Client(project=project, location=location)
@@ -222,9 +214,7 @@ def pick_audit_column(temporal_columns: list) -> str:
     return ""
 
 
-# ---------------------------------------------------------
-# Scan-id build + validation
-# ---------------------------------------------------------
+# --- Scan-id build + validation ---------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def _load_abbreviations(path: str, mtime: float) -> dict:
     """full_word -> abbreviation (lowercased); empty value = drop the token."""
@@ -251,14 +241,9 @@ def strip_bq_prefix(table: str) -> str:
 
 
 def _abbreviate_tokens(text: str, abbrev: dict) -> str:
-    out = []
-    for part in text.split("_"):
-        if part.lower() in abbrev:
-            if abbrev[part.lower()]:
-                out.append(abbrev[part.lower()])
-        else:
-            out.append(part)
-    return "_".join(out)
+    """Map each _-token through abbrev; drop-tokens (mapped to '') disappear."""
+    mapped = ((part, abbrev.get(part.lower(), part)) for part in text.split("_"))
+    return "_".join(m for part, m in mapped if m or part.lower() not in abbrev)
 
 
 def trim_job_id(job_id: str, abbrev: dict) -> str:
@@ -322,9 +307,7 @@ def resolve_scan_id(prefix: str, dataset: str, table: str, forbidden: set,
     return candidate
 
 
-# ---------------------------------------------------------
-# Governance-YAML inventory (mtime-cached)
-# ---------------------------------------------------------
+# --- Governance-YAML inventory (mtime-cached) ----------------------------------------------
 @st.cache_data(show_spinner=False, max_entries=256)
 def _load_yaml(path: str, mtime: float):
     try:
@@ -372,9 +355,7 @@ def merge_file_text(existing_text, header, blocks) -> str:
     return base.rstrip("\n") + "\n"
 
 
-# ---------------------------------------------------------
-# YAML scalar rendering + repair + validation
-# ---------------------------------------------------------
+# --- YAML scalar rendering + repair + validation ---------------------------------------------
 # Both apps emit governance YAML as text so the hand-maintained layout survives
 # byte-for-byte; correct quoting is therefore this module's job.
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -470,9 +451,7 @@ def render_file_header(top_key: str, cron, publishing, export_ds) -> str:
     )
 
 
-# ---------------------------------------------------------
-# Shared UI blocks
-# ---------------------------------------------------------
+# --- Shared UI blocks --------------------------------------------------------------------------
 def setup_page(title: str):
     st.set_page_config(page_title=title, layout="wide")
     st.markdown(_APP_CSS, unsafe_allow_html=True)
@@ -617,23 +596,19 @@ def render_preview_and_deploy(existing_text, header, blocks, target_path,
 
     st.write("### Deployment")
     can_deploy = bool(blocks) and deployable
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Write to Dataplex repo", disabled=not can_deploy):
-            try:
-                os.makedirs(governance_dir, exist_ok=True)
-                with open(target_path, "w", encoding="utf-8", newline="\n") as f:
-                    f.write(full_text)
-                st.success(f"Wrote {target_path} (+{len(blocks)} scan(s)). "
-                           "Commit and push to deploy via the orchestrator.")
-            except OSError as e:
-                st.error(f"Write failed: {e}")
-    with col2:
-        if st.button("Save copy to workspace root", disabled=not can_deploy):
-            try:
-                path = os.path.join(os.path.dirname(__file__), "..", output_filename)
-                with open(path, "w", encoding="utf-8", newline="\n") as f:
-                    f.write(full_text)
-                st.success(f"Saved {output_filename}.")
-            except OSError as e:
-                st.error(f"Write failed: {e}")
+    exits = (("Write to Dataplex repo", target_path,
+              f"Wrote {target_path} (+{len(blocks)} scan(s)). "
+              "Commit and push to deploy via the orchestrator."),
+             ("Save copy to workspace root",
+              os.path.join(os.path.dirname(__file__), "..", output_filename),
+              f"Saved {output_filename}."))
+    for column, (label, path, done_msg) in zip(st.columns(2), exits):
+        with column:
+            if st.button(label, disabled=not can_deploy):
+                try:
+                    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                    with open(path, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(full_text)
+                    st.success(done_msg)
+                except OSError as e:
+                    st.error(f"Write failed: {e}")

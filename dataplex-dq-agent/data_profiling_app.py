@@ -33,10 +33,9 @@ from dq_common import (
 # `field` is typed by hand and lands inside a SQL row_filter, so it is held to
 # the BigQuery column-identifier charset before being rendered.
 FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+NEEDS_FIELD = "needs field — type one below"
 
-# ---------------------------------------------------------
-# Page + sidebar
-# ---------------------------------------------------------
+# --- Page + sidebar -----------------------------------------------------------
 setup_page("Dataplex Data Profiling Scan (DPS) Generator")
 
 environment, instance, source_project_id, repo_root = sidebar_connection()
@@ -61,9 +60,8 @@ governance_dir = os.path.join(repo_root, "edemm", environment, "governance")
 job_prefix = instance
 output_filename = f"{instance}_dps_{source_dataset_id}.yaml"
 
-# ---------------------------------------------------------
-# Field resolution (metadata helpers shared via dq_common)
-# ---------------------------------------------------------
+
+# --- Field resolution (metadata helpers shared via dq_common) -------------------
 def resolve_field(meta: dict):
     """The CLI's 6-step cascade. Returns (field, source_note); an empty field
     means manual review (the user can still type one in the editor)."""
@@ -84,9 +82,7 @@ def resolve_field(meta: dict):
     return "", "no temporal partition or audit column found — manual review"
 
 
-# ---------------------------------------------------------
-# Repo inventory (DPS-specific)
-# ---------------------------------------------------------
+# --- Repo inventory (DPS-specific) -----------------------------------------------
 def load_repo_dps_tables(gov_dir: str, prefix: str) -> dict:
     """{(project, dataset, table): job_id} across every DPS file — used to
     skip tables that already have a profiling scan (additive-only)."""
@@ -105,36 +101,14 @@ def load_repo_dps_tables(gov_dir: str, prefix: str) -> dict:
 
 def read_existing_cron(yaml_path: str) -> str:
     """Global cron of an existing DPS file ('' if unreadable/absent)."""
-    try:
-        document = load_yaml(yaml_path)
-        if not isinstance(document, dict):
-            return ""
-        governance = document.get("governance")
-        if not isinstance(governance, dict):
-            return ""
-        consumer_governance = governance.get("consumer-governance")
-        if not isinstance(consumer_governance, dict):
-            return ""
-        dataplex_dp = consumer_governance.get("dataplex-dp")
-        if not isinstance(dataplex_dp, dict):
-            return ""
-        execution_spec = dataplex_dp.get("execution_spec")
-        if not isinstance(execution_spec, dict):
-            return ""
-        trigger = execution_spec.get("trigger")
-        if not isinstance(trigger, dict):
-            return ""
-        schedule = trigger.get("schedule")
-        if not isinstance(schedule, dict):
-            return ""
-        return str(schedule.get("cron") or "").strip()
-    except (KeyError, TypeError):
-        return ""
+    node = load_yaml(yaml_path)
+    for key in ("governance", "consumer-governance", "dataplex-dp",
+                "execution_spec", "trigger", "schedule"):
+        node = node.get(key) if isinstance(node, dict) else None
+    return str(node.get("cron") or "").strip() if isinstance(node, dict) else ""
 
 
-# ---------------------------------------------------------
-# YAML block rendering
-# ---------------------------------------------------------
+# --- YAML block rendering -----------------------------------------------------------
 def render_scan_block(job_id, project_id_, dataset_id_, table_id_, field_column, cron) -> str:
     # DATE() is polymorphic over TIMESTAMP/DATETIME/DATE, so one row_filter
     # template covers every resolvable field type.
@@ -155,9 +129,7 @@ def render_scan_block(job_id, project_id_, dataset_id_, table_id_, field_column,
     ])
 
 
-# ---------------------------------------------------------
-# LLM rename fallback (validated outside the model)
-# ---------------------------------------------------------
+# --- LLM rename fallback (validated outside the model) --------------------------------
 def llm_rename_scan_ids(failing: list, forbidden: set) -> dict:
     """{table: new_id}, keeping only suggestions that pass validate_scan_id."""
     system_instruction = (
@@ -182,9 +154,7 @@ def llm_rename_scan_ids(failing: list, forbidden: set) -> dict:
     return accepted
 
 
-# ---------------------------------------------------------
-# UI flow
-# ---------------------------------------------------------
+# --- UI flow ----------------------------------------------------------------------------
 st.write("### Target Selection")
 st.caption(f"Env **{environment}** / **{instance}**, source project `{source_project_id}`, "
            f"output `edemm/{environment}/governance/{output_filename}`.")
@@ -221,7 +191,7 @@ if table_names:
                                            "reason": reason})
                 plan.append({"table": table, "scan_id": scan_id,
                              "field": field, "field_source": source,
-                             "status": (("ok" if field else "needs field — type one below")
+                             "status": (("ok" if field else NEEDS_FIELD)
                                         if ok else f"skip: {reason}"),
                              "locked": False})
             if llm_candidates and use_llm_rename and fuelix_api_key:
@@ -236,7 +206,7 @@ if table_names:
                     new_id = renames.get(row["table"])
                     if new_id:
                         row["scan_id"], row["status"] = new_id, (
-                            "ok (LLM-renamed)" if row["field"] else "needs field — type one below")
+                            "ok (LLM-renamed)" if row["field"] else NEEDS_FIELD)
                         assigned.add(new_id)
             # Deterministic retry: any id still invalid after the optional LLM
             # rename is truncated/suffixed until valid and unique — never skipped.
@@ -246,7 +216,7 @@ if table_names:
                     new_id = resolve_scan_id(job_prefix, source_dataset_id,
                                              row["table"], forbidden | assigned)
                     row["scan_id"], row["status"] = new_id, (
-                        "ok (auto-renamed)" if row["field"] else "needs field — type one below")
+                        "ok (auto-renamed)" if row["field"] else NEEDS_FIELD)
                     assigned.add(new_id)
             st.session_state["dps_plan"] = plan
         except Exception as e:
@@ -268,13 +238,9 @@ if "dps_plan" in st.session_state:
     file_exists, existing_text = read_target(target_path)
 
     # Additive-only: an existing file's cron is reused for appended scans.
-    effective_cron = scan_cron
-    if file_exists:
-        existing_cron = read_existing_cron(target_path)
-        if existing_cron:
-            effective_cron = existing_cron
-            if existing_cron != scan_cron:
-                st.info(f"Existing file cron `{existing_cron}` reused for appended scans.")
+    effective_cron = (read_existing_cron(target_path) if file_exists else "") or scan_cron
+    if file_exists and effective_cron != scan_cron:
+        st.info(f"Existing file cron `{effective_cron}` reused for appended scans.")
 
     blocks, scan_ids, skipped = [], [], []
     # pd.DataFrame(...) normalizes data_editor's loosely-typed return (cheap
