@@ -20,7 +20,9 @@ Shared plumbing and the gated YAML validation/deploy path live in dq_common."""
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
+from typing import cast
 
 import requests
 import streamlit as st
@@ -62,7 +64,8 @@ gen_descriptions = st.sidebar.checkbox(
          "to the model to draft business descriptions (saved to descriptions/*.xlsx) "
          "that are then used alongside profiling stats for rule generation. When "
          "off, only Dataplex profiling statistics are used and no table data is "
-         "sent to the LLM.")
+         "sent to the LLM. Columns carrying a BigQuery policy tag are always "
+         "excluded from every LLM payload.")
 use_collibra, collibra_url, collibra_domain = False, "", ""
 if gen_descriptions:
     use_collibra = st.sidebar.checkbox(
@@ -124,13 +127,75 @@ def get_column_profiles(project: str, dataset: str, profile_table: str,
 
 
 # ---------------------------------------------------------
+# Policy-tag firewall: columns carrying a Data Catalog policy tag never have
+# their data or profiling statistics passed to any LLM.
+# ---------------------------------------------------------
+@st.cache_data(ttl="15m", show_spinner=False)
+def fetch_policy_tags(project: str, dataset: str, location: str, tables: tuple) -> dict:
+    """{table: (dotted paths of fields carrying a policy tag, ...)}. Policy tags
+    are only exposed by the Tables API, not INFORMATION_SCHEMA, hence one
+    get_table per table (threaded). Raises on lookup failure so callers fail
+    closed instead of risking a protected column slipping into an LLM payload."""
+    client = get_bq_client(project, location)
+
+    def walk(fields, prefix=""):
+        for f in fields:
+            if f.policy_tags and f.policy_tags.names:
+                yield prefix + f.name
+            yield from walk(f.fields or (), prefix + f.name + ".")
+
+    def tagged_paths(table: str) -> tuple:
+        return tuple(walk(client.get_table(f"{project}.{dataset}.{table}").schema))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return dict(zip(tables, pool.map(tagged_paths, tables)))
+
+
+def _is_tagged(column: str, tagged_paths: tuple) -> bool:
+    """True when the column is a tagged field or nested under/above one."""
+    return any(column == t or column.startswith(t + ".") or t.startswith(column + ".")
+               for t in tagged_paths)
+
+
+def _label_list(labels: list) -> str:
+    head = ", ".join(f"`{x}`" for x in labels[:60])
+    return head + (f" … and {len(labels) - 60} more" if len(labels) > 60 else "")
+
+
+def get_profiles_for_llm(tables: list) -> tuple[list, dict]:
+    """(profiles, tagged): latest profiling rows minus policy-tagged columns —
+    the single source of profiling data for LLM prompts — plus the tagged-path
+    map for the description firewall and the reports."""
+    profiles = get_column_profiles(project_id, dataset_id, profile_table_name,
+                                   source_dataset_id, tuple(tables), bq_location)
+    tagged = fetch_policy_tags(source_project_id, source_dataset_id, bq_location,
+                               tuple(tables))
+    kept = [p for p in profiles
+            if not _is_tagged(str(p.get("column_name")),
+                              tagged.get(str(p.get("table_name")), ()))]
+    excluded = [f"{t}.{c}" for t in sorted(tagged) for c in tagged[t]]
+    if excluded:
+        st.info("Policy-tagged columns excluded from every LLM payload (no sample "
+                "data, no profiling statistics, no descriptions): "
+                + _label_list(excluded))
+    return kept, tagged
+
+
+# ---------------------------------------------------------
 # Optional description generation (TELUS GenAI prompt standards)
 # ---------------------------------------------------------
 SAMPLE_ROW_COUNT = 1000     # window of most recent rows fetched per table
 _EVIDENCE_ROWS = 20         # full rows from that window forwarded to the model
 _EVIDENCE_TOP_VALUES = 12   # most frequent values per column forwarded
 _EVIDENCE_CELL_CAP = 80     # cell truncation before prompting
-UNABLE_PHRASE = "Unable to Generate Description"
+UNABLE_PHRASE = "Unable to Generate Description"  # LLM sentinel; stored as null
+_UNABLE_RE = re.compile(re.escape(UNABLE_PHRASE) + r"\.?", re.IGNORECASE)
+
+
+def _null_if_unable(text) -> str | None:
+    """Stored value for one LLM description: None for blank or the sentinel."""
+    text = str(text or "").strip()
+    return None if not text or _UNABLE_RE.fullmatch(text) else text
 
 
 def _latest_partition_filter(project: str, dataset: str, table: str,
@@ -167,17 +232,22 @@ def _latest_partition_filter(project: str, dataset: str, table: str,
 
 
 def fetch_last_rows(project: str, dataset: str, table: str, location: str,
-                    meta: dict, n: int = SAMPLE_ROW_COUNT) -> list:
+                    meta: dict, n: int = SAMPLE_ROW_COUNT,
+                    exclude: frozenset = frozenset()) -> list:
     """Most recent n rows as dicts (best effort): newest partition, ordered by
     the audit/temporal column when one exists. Retries without ORDER BY, then
     without the partition filter (unless the table requires one); [] when every
-    attempt fails — descriptions then rely on profiling stats and names only."""
+    attempt fails — descriptions then rely on profiling stats and names only.
+    `exclude` (policy-tagged top-level columns) is dropped in the SELECT itself,
+    so protected data is never even fetched."""
     where = _latest_partition_filter(project, dataset, table, location, meta)
     order_col = pick_audit_column(meta["temporal_columns"])
     if not order_col and meta["partition_column_type"] in ("DATE", "TIMESTAMP", "DATETIME"):
         order_col = meta["partition_column"]
     order = f" ORDER BY `{order_col}` DESC" if order_col else ""
-    base = f"SELECT * FROM `{project}.{dataset}.{table}`"
+    select = ("* EXCEPT (" + ", ".join(f"`{c}`" for c in sorted(exclude)) + ")"
+              if exclude else "*")
+    base = f"SELECT {select} FROM `{project}.{dataset}.{table}`"
     attempts = []
     if where:
         attempts.append(f"{base} {where}{order} LIMIT {n}")
@@ -442,10 +512,13 @@ def _table_profiles(profiles: list, table: str) -> list:
             for p in profiles if p.get("table_name") == table]
 
 
-def generate_descriptions(tables: list, profiles: list) -> dict:
-    """{table: {"table_description": str, "columns": {col: desc}}} — two FuelIX
-    calls per table (table text, then batch column JSON), grounded in the last
-    SAMPLE_ROW_COUNT rows and the Dataplex profiling statistics."""
+def generate_descriptions(tables: list, profiles: list, tagged: dict) -> dict:
+    """{table: {"table_description": str|None, "columns": {col: str|None}}} —
+    two FuelIX calls per table (table text, then batch column JSON), grounded in
+    the last SAMPLE_ROW_COUNT rows and the (policy-filtered) profiling stats.
+    Policy-tagged columns are excluded from sampling and every prompt, and are
+    recorded with a null description; blank/sentinel replies and per-table LLM
+    failures also store null."""
     meta = fetch_table_metadata(source_project_id, source_dataset_id,
                                 bq_location, tuple(tables))
     glossary, collibra_key = {}, ""
@@ -458,8 +531,10 @@ def generate_descriptions(tables: list, profiles: list) -> dict:
             st.warning(f"Collibra glossary unavailable ({e}) — continuing without it.")
     out = {}
     for table in tables:
+        tagged_paths = tagged.get(table, ())
         rows = fetch_last_rows(source_project_id, source_dataset_id, table,
-                               bq_location, meta[table])
+                               bq_location, meta[table],
+                               exclude=frozenset(t.split(".")[0] for t in tagged_paths))
         stats = _table_profiles(profiles, table)
         evidence = build_sample_evidence(rows)
         col_names = (list(evidence["columns"].keys()) if evidence
@@ -494,23 +569,24 @@ def generate_descriptions(tables: list, profiles: list) -> dict:
                             "table's name/column segments — reference hints for "
                             "interpreting abbreviations, not data):\n" + ch)
         try:
-            table_desc = call_fuelix(_SYS_TABLE_DESC,
-                                     "Generate the table description.\n" + context,
-                                     fuelix_api_key, model_name).strip()
-            col_map = {}
+            table_desc = _null_if_unable(call_fuelix(
+                _SYS_TABLE_DESC, "Generate the table description.\n" + context,
+                fuelix_api_key, model_name))
+            col_map: dict[str, str | None] = {}
             if col_names:
                 col_prompt = (f"COLUMNS TO DESCRIBE: {json.dumps(col_names)}\n"
-                              f"TABLE DESCRIPTION: {table_desc}\n" + context +
+                              f"TABLE DESCRIPTION: {table_desc or ''}\n" + context +
                               "\nGenerate the JSON object of column descriptions.")
                 data = parse_llm_json(call_fuelix(_SYS_COL_DESC, col_prompt,
                                                   fuelix_api_key, model_name))
                 found = data.get("columns", data) if isinstance(data, dict) else {}
-                col_map = {c: str(found.get(c) or UNABLE_PHRASE).strip() for c in col_names}
+                col_map = {c: _null_if_unable(found.get(c)) for c in col_names}
         except Exception as e:
             st.warning(f"Descriptions for `{table}` failed: {e}")
-            table_desc, col_map = UNABLE_PHRASE, {}
-        out[table] = {"table_description": table_desc or UNABLE_PHRASE,
-                      "columns": col_map}
+            table_desc, col_map = None, dict.fromkeys(col_names)
+        for path in tagged_paths:  # visible in Excel/report, never sent to the LLM
+            col_map.setdefault(path, None)
+        out[table] = {"table_description": table_desc, "columns": col_map}
     return out
 
 
@@ -532,15 +608,17 @@ def save_descriptions_xlsx(path: str, descriptions: dict) -> bool:
     problems such as the workbook being open in Excel."""
     try:
         import openpyxl
-        from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+        from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE, Cell
     except ImportError:
         st.error("openpyxl is not installed — run `pip install openpyxl` to save "
                  "descriptions to Excel.")
         return False
 
-    def clean(value) -> str:
+    def clean(value):
         # openpyxl raises IllegalCharacterError on XML-invalid control chars.
-        return ILLEGAL_CHARACTERS_RE.sub("", "" if value is None else str(value))
+        # None passes through so a null description stays a truly blank cell
+        # (and the upsert clears any previously saved placeholder text).
+        return None if value is None else ILLEGAL_CHARACTERS_RE.sub("", str(value))
 
     def cell_key(value) -> str:
         return "" if value is None else str(value).strip()
@@ -577,12 +655,13 @@ def save_descriptions_xlsx(path: str, descriptions: dict) -> bool:
             ws = wb.create_sheet("descriptions")
             ws.append(_XLSX_HEADER)
         updated = set()
-        for row_idx, row in enumerate(ws.iter_rows(min_row=2, max_col=len(_XLSX_HEADER)), start=2):
+        for row in ws.iter_rows(min_row=2, max_col=len(_XLSX_HEADER)):
             key = tuple(cell_key(row[i].value) for i in range(3))
             if key in fresh:
-                ws.cell(row=row_idx, column=4, value=fresh[key])
-                ws.cell(row=row_idx, column=5, value=model_name)
-                ws.cell(row=row_idx, column=6, value=ts)
+                # assign via .value: cell(value=None) would skip the write and
+                # leave stale text behind instead of blanking the cell.
+                cells = cast("tuple[Cell, ...]", row)
+                cells[3].value, cells[4].value, cells[5].value = fresh[key], model_name, ts
                 updated.add(key)
         for (ds, table, col), desc in fresh.items():
             if (ds, table, col) not in updated:
@@ -616,10 +695,39 @@ def flatten_descriptions(descriptions: dict) -> list:
     return out
 
 
+def null_description_labels(descriptions: dict, tagged: dict) -> tuple[list, list]:
+    """(failed, policy_excluded) 'table' / 'table.column' labels for the null
+    descriptions, split by cause for the post-generation report."""
+    failed, excluded = [], []
+    for table, info in descriptions.items():
+        tagged_paths = tagged.get(table, ())
+        if info.get("table_description") is None:
+            failed.append(table)
+        for col, desc in info.get("columns", {}).items():
+            if desc is None:
+                (excluded if _is_tagged(col, tagged_paths)
+                 else failed).append(f"{table}.{col}")
+    return failed, excluded
+
+
 def active_descriptions():
     """Descriptions for prompt injection — None whenever the feature is off, so
-    a stale session/Excel can never leak into prompts while disabled."""
-    return st.session_state.get("descriptions") if gen_descriptions else None
+    a stale session/Excel can never leak into prompts while disabled. Null
+    descriptions are pruned, so neither nulls nor policy-tagged column names
+    ever reach the action-plan/rule prompts."""
+    if not gen_descriptions:
+        return None
+    pruned = {}
+    for table, info in (st.session_state.get("descriptions") or {}).items():
+        entry: dict = {}
+        if info.get("table_description"):
+            entry["table_description"] = info["table_description"]
+        columns = {c: d for c, d in info.get("columns", {}).items() if d}
+        if columns:
+            entry["columns"] = columns
+        if entry:
+            pruned[table] = entry
+    return pruned or None
 
 
 # ---------------------------------------------------------
@@ -838,13 +946,16 @@ if table_names and gen_descriptions:
                f"{SAMPLE_ROW_COUNT} rows per table to the model, held to the TELUS "
                "description standards. Results are saved to "
                f"`descriptions/{instance}_dq_descriptions_{source_dataset_id}.xlsx` "
-               "and fed into the action plan and rule generation.")
+               "and fed into the action plan and rule generation. Policy-tagged "
+               "columns are excluded from every LLM payload, and descriptions the "
+               "model cannot produce are stored as null.")
     if st.button("Generate Descriptions"):
         with st.spinner("Sampling recent rows and drafting descriptions..."):
             try:
-                profiles = get_column_profiles(project_id, dataset_id, profile_table_name,
-                                               source_dataset_id, tuple(table_names), bq_location)
-                st.session_state["descriptions"] = generate_descriptions(table_names, profiles)
+                profiles, tagged = get_profiles_for_llm(table_names)
+                st.session_state["descriptions"] = generate_descriptions(
+                    table_names, profiles, tagged)
+                st.session_state["desc_policy_tags"] = tagged
                 st.session_state.pop("action_plan", None)
                 st.session_state.pop("rules_by_table", None)
                 xlsx_path = descriptions_xlsx_path()
@@ -854,6 +965,14 @@ if table_names and gen_descriptions:
                 st.error(f"Error generating descriptions: {e}")
     if "descriptions" in st.session_state:
         st.dataframe(flatten_descriptions(st.session_state["descriptions"]), width="stretch")
+        failed, excluded = null_description_labels(
+            st.session_state["descriptions"], st.session_state.get("desc_policy_tags", {}))
+        if failed:
+            st.warning("No description could be generated (stored as null) for: "
+                       + _label_list(failed))
+        if excluded:
+            st.info("Excluded from LLM payloads by policy tags (description left "
+                    "null): " + _label_list(excluded))
 
 if table_names:
     st.write("---")
@@ -861,8 +980,7 @@ if table_names:
     if st.button("Generate Action Plan"):
         with st.spinner("Retrieving profiling statistics and drafting plan..."):
             try:
-                profiles = get_column_profiles(project_id, dataset_id, profile_table_name,
-                                               source_dataset_id, tuple(table_names), bq_location)
+                profiles = get_profiles_for_llm(table_names)[0]
                 st.session_state["profiles"] = profiles
                 st.session_state["table_order"] = table_names
                 st.session_state.pop("rules_by_table", None)
