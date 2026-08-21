@@ -16,6 +16,7 @@ The pipeline lives in dq_generation (streamlit-free, dependency-injected),
 shared plumbing in dq_core, and the shared UI/caching layer in dq_ui."""
 import logging
 import os
+from datetime import date
 
 import streamlit as st
 
@@ -61,6 +62,7 @@ gen_descriptions = st.sidebar.checkbox(
          "table data is sent to the LLM. Columns carrying a BigQuery policy tag "
          "are always excluded from every LLM payload.")
 use_collibra, collibra_url, collibra_domain = False, "", ""
+refresh_collibra = True  # no saved CSV yet -> first retrieval is live and saves it
 if gen_descriptions:
     use_collibra = st.sidebar.checkbox(
         "Enrich with Collibra glossary", value=False,
@@ -69,12 +71,22 @@ if gen_descriptions:
              "terms matched to table/column name segments into the description "
              "prompts.")
     if use_collibra:
-        collibra_url = st.sidebar.text_input("Collibra URL",
-                                             value="https://telus.collibra.com")
-        collibra_domain = st.sidebar.text_input(
-            "Collibra domain id (optional)", value="",
-            help="Narrows the import to one glossary domain; blank = all "
-                 "Business Terms org-wide.")
+        if os.path.exists(gen.COLLIBRA_CSV):
+            refresh_collibra = st.sidebar.checkbox(
+                "Refresh glossary from Collibra (replaces the saved CSV)", value=False,
+                help="Off: reuse the glossary saved in reference/collibra_glossary.csv "
+                     "from the last retrieval — no Collibra calls. On: retrieve live "
+                     "and replace the saved copy.")
+            st.sidebar.caption(
+                f"Saved glossary from {date.fromtimestamp(os.path.getmtime(gen.COLLIBRA_CSV))}"
+                " — reused unless refreshed.")
+        if refresh_collibra:
+            collibra_url = st.sidebar.text_input("Collibra URL",
+                                                 value="https://telus.collibra.com")
+            collibra_domain = st.sidebar.text_input(
+                "Collibra domain id (optional)", value="",
+                help="Narrows the import to one glossary domain; blank = all "
+                     "Business Terms org-wide.")
 scan_cron, export_dataset, catalog_publishing_enabled = sidebar_scan_settings(
     "DQ Scan Settings", "0 7 * * *",
     "Header cron for a NEW dataset file; existing files keep theirs.")
@@ -192,8 +204,12 @@ if table_names and gen_descriptions:
                             table_names, profiles, tagged, settings,
                             call_llm=call_llm, fetch_table_meta=fetch_table_metadata,
                             fetch_rows=fetch_rows, notify=st_notify,
-                            load_glossary=((lambda: gen.load_collibra(settings))
-                                           if use_collibra else None),
+                            load_glossary=(
+                                (lambda: gen.load_collibra(settings,
+                                                           save_path=gen.COLLIBRA_CSV))
+                                if use_collibra and refresh_collibra
+                                else (lambda: gen.load_collibra_csv(gen.COLLIBRA_CSV))
+                                if use_collibra else None),
                             existing=existing, fill_only_missing=hybrid)
                         st.session_state["desc_policy_tags"] = tagged
                 st.session_state.pop("action_plan", None)

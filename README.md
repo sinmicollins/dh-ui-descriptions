@@ -21,7 +21,9 @@ By leveraging metadata aspects bound directly to Catalog entry schemas instead o
 │   ├── dq_ui.py                 # Streamlit layer: cached wrappers + shared page/sidebar/deploy blocks
 │   ├── tests/                   # Pytest behavior suite (dependency-injected fakes, no cloud access needed)
 │   ├── descriptions/            # Generated table/column description workbooks (data — do not delete)
-│   ├── abbreviations.csv        # Token abbreviations used to fit scan ids in 36 chars
+│   ├── reference/               # Shared reference data
+│   │   ├── abbreviations.csv        # Token abbreviations used to fit scan ids in 36 chars
+│   │   └── collibra_glossary.csv    # Saved Collibra Business Terms (written on retrieval, reused until refreshed)
 │   └── requirements.txt         # Pinned app dependencies (requirements-dev.txt adds pytest)
 ├── pulumi-approach/             # Infrastructure-as-Code deployment project
 │   ├── __main__.py              # Main Pulumi script (loads rules spec dynamically)
@@ -39,7 +41,7 @@ By leveraging metadata aspects bound directly to Catalog entry schemas instead o
 ## 🚀 Workflows & Getting Started
 
 ### Workflow 1: Generate Rules Specs via the GenAI Agent
-The **Dataplex Auto-DQ Spec Generator Agent** is a Streamlit app that reads historical column profiling metrics directly from BigQuery, uses an LLM via the **FuelIX gateway** (model picker in the sidebar; default `mistral-small-3.2-24b`) to propose rule configurations, accepts human feedback/spreadsheets, and generates your scan YAML.
+The **Dataplex Auto-DQ Spec Generator Agent** is a Streamlit app that reads historical column profiling metrics directly from BigQuery, uses an LLM via the **FuelIX gateway** (model picker in the sidebar; default `gemma-4-saif`) to propose rule configurations, accepts human feedback/spreadsheets, and generates your scan YAML.
 
 #### Setup & Launch:
 ```bash

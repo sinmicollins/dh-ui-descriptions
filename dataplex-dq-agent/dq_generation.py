@@ -16,6 +16,7 @@ descriptions store, and DQ-rule YAML rendering. Every side effect is injected:
 BigQuery clients come in as parameters, the LLM as a `call_llm(system, user)`
 callable, and UI messages go through a `notify(level, text)` callable — so the
 whole pipeline is testable without Streamlit and free of module-global state."""
+import csv
 import json
 import logging
 import os
@@ -33,7 +34,7 @@ from google.api_core.exceptions import GoogleAPIError
 from google.cloud import bigquery
 
 from dq_core import (
-    KNOWN_ERRORS, bq_ident, collect_repo_scan_ids, finite_float,
+    KNOWN_ERRORS, REFERENCE_DIR, bq_ident, collect_repo_scan_ids, finite_float,
     load_abbreviations, parse_llm_json, pick_audit_column, resolve_scan_id,
     validate_scan_id, yaml_quote,
 )
@@ -285,6 +286,8 @@ def build_sample_evidence(rows: list, max_rows: int = _EVIDENCE_ROWS,
 COLLIBRA_SECRET_PROJECT = "cto-collibra-insights-pr-2267"
 COLLIBRA_SECRET_NAME = "collibra_api_key"
 _BUSINESS_TERM_TYPE_ID = "00000000-0000-0000-0000-000000011001"  # packaged Business Term
+COLLIBRA_CSV = os.path.join(REFERENCE_DIR, "collibra_glossary.csv")
+_COLLIBRA_CSV_FIELDS = ("term", "full_name", "asset_id", "definition")
 _GLOSSARY_MAX_LINES = 40
 _CONTEXT_CHAR_CAP = 80_000  # keep description prompts inside gateway limits
 _COLLIBRA_ERRORS = (GoogleAPIError, google.auth.exceptions.GoogleAuthError,
@@ -384,15 +387,71 @@ def fetch_collibra_definitions(base_url: str, auth: dict, asset_ids: tuple,
     return defs
 
 
+def _read_collibra_csv(path: str) -> list[dict]:
+    """Rows of a saved glossary CSV; raises on read/parse problems."""
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        return [{f: str(row.get(f) or "") for f in _COLLIBRA_CSV_FIELDS}
+                for row in csv.DictReader(fh)]
+
+
+def save_collibra_csv(path: str, glossary: dict, defs: dict) -> None:
+    """Replace the saved glossary CSV with `glossary` (one row per term, sorted).
+    The definition column takes `defs[asset_id]` and falls back to the previous
+    file's value, so definitions accumulated over runs survive a refresh; terms
+    no longer in the glossary are dropped. Write failures are non-fatal (the
+    run's enrichment already succeeded): logged, old file left as-is."""
+    try:
+        carried = {}
+        if os.path.exists(path):
+            carried = {r["asset_id"]: r["definition"]
+                       for r in _read_collibra_csv(path) if r["definition"]}
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(_COLLIBRA_CSV_FIELDS)
+            for term in sorted(glossary):
+                m = glossary[term]
+                writer.writerow([m["name"], m["full"], m["id"],
+                                 defs.get(m["id"]) or carried.get(m["id"], "")])
+        logger.info("collibra glossary saved: %s (%d terms)", path, len(glossary))
+    except (OSError, csv.Error, KeyError, TypeError, UnicodeDecodeError) as e:
+        logger.warning("collibra glossary CSV not saved (%s): %s", path, e)
+
+
+def load_collibra_csv(path: str):
+    """(glossary, fetch_defs) from the saved CSV — the same contract as
+    load_collibra, with definitions limited to those already saved and zero
+    Collibra traffic. Raises RuntimeError on an unreadable file; the caller
+    degrades gracefully."""
+    try:
+        rows = _read_collibra_csv(path)
+    except (OSError, csv.Error, UnicodeDecodeError) as e:
+        raise RuntimeError(f"saved Collibra glossary unreadable ({path}): {e}") from e
+    glossary = {r["term"].lower(): {"id": r["asset_id"], "name": r["term"],
+                                    "full": r["full_name"] or r["term"]}
+                for r in rows if r["term"]}
+    defs = {r["asset_id"]: r["definition"]
+            for r in rows if r["asset_id"] and r["definition"]}
+
+    def fetch_defs(asset_ids: tuple) -> dict:
+        return {a: defs[a] for a in asset_ids if defs.get(a)}
+    logger.info("collibra glossary loaded from CSV: %s (%d terms)", path, len(glossary))
+    return glossary, fetch_defs
+
+
 def load_collibra(settings: Settings, *, get_key=get_collibra_auth_key,
-                  http=requests):
+                  http=requests, save_path: str = ""):
     """(glossary, fetch_defs) for one run: the auth scheme is probed once and
     held only in locals, and definitions are memoized per asset id within the
-    run — no credentials end up in any cross-run cache. Raises on failure;
+    run — no credentials end up in any cross-run cache. With `save_path`, the
+    retrieval (and each newly fetched batch of definitions) is persisted to that
+    CSV for later offline reuse via load_collibra_csv. Raises on failure;
     the caller degrades gracefully."""
     auth = _pick_collibra_auth(settings.collibra_url, get_key(), http)
     glossary = fetch_collibra_glossary(settings.collibra_url,
                                        settings.collibra_domain, auth, http)
+    if save_path:
+        save_collibra_csv(save_path, glossary, {})
     memo: dict = {}
 
     def fetch_defs(asset_ids: tuple) -> dict:
@@ -401,6 +460,8 @@ def load_collibra(settings: Settings, *, get_key=get_collibra_auth_key,
             found = fetch_collibra_definitions(settings.collibra_url, auth,
                                                missing, http)
             memo.update({a: found.get(a, "") for a in missing})
+            if save_path and found:
+                save_collibra_csv(save_path, glossary, memo)
         return {a: memo[a] for a in asset_ids if memo.get(a)}
     return glossary, fetch_defs
 

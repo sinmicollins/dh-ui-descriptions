@@ -315,6 +315,66 @@ def test_collibra_auth_cascade(notes):
         "rejected every auth scheme" in fail_notes.warnings[0], fail_notes.warnings
 
 
+# --- 9b. saved glossary CSV: round trip, refresh merge, offline reuse ---------------------
+def glossary_of(*triples):
+    return {name.lower(): {"id": aid, "name": name, "full": full}
+            for name, full, aid in triples}
+
+
+def test_collibra_csv_round_trip(tmp_path):
+    path = str(tmp_path / "collibra_glossary.csv")
+    glossary = glossary_of(("5G", "5th Generation", "id-5g"),
+                           ("ACCT", "Compte, señor", "id-acct"),
+                           ("ACTVN", "Activation", "id-actvn"))
+    gen.save_collibra_csv(path, glossary, {"id-5g": "Fifth generation, of networks"})
+    loaded, fetch_defs = gen.load_collibra_csv(path)
+    assert loaded == glossary
+    assert fetch_defs(("id-5g", "id-acct")) == {"id-5g": "Fifth generation, of networks"}
+
+
+def test_collibra_csv_refresh_preserves_surviving_definitions(tmp_path):
+    path = str(tmp_path / "collibra_glossary.csv")
+    gen.save_collibra_csv(path, glossary_of(("A", "Aaa", "id-a"), ("B", "Bbb", "id-b")),
+                          {"id-a": "old A def", "id-b": "old B def"})
+    gen.save_collibra_csv(path, glossary_of(("A", "Aaa", "id-a"), ("C", "Ccc", "id-c")),
+                          {"id-c": "new C def"})
+    loaded, fetch_defs = gen.load_collibra_csv(path)
+    assert set(loaded) == {"a", "c"}
+    assert fetch_defs(("id-a", "id-b", "id-c")) == {"id-a": "old A def",
+                                                    "id-c": "new C def"}
+
+
+def test_load_collibra_persists_retrieval_then_offline_reuse(tmp_path, notes):
+    path = str(tmp_path / "collibra_glossary.csv")
+    settings = collibra_settings()
+    prompts = []
+    load_glossary = lambda: gen.load_collibra(settings, get_key=lambda: "KEY",
+                                              http=CollibraHttp(), save_path=path)
+    run_descs(settings, notes, prompts, load_glossary=load_glossary)
+    loaded, fetch_defs = gen.load_collibra_csv(path)
+    assert set(loaded) == {"5g", "acct", "actvn"}
+    assert fetch_defs(("id-5g",)) == {"id-5g": "The fifth generation of mobile networks."}
+
+    # a later run off the saved CSV injects the same hints with zero Collibra traffic
+    prompts.clear()
+    offline_notes = Notes()
+    run_descs(settings, offline_notes, prompts,
+              load_glossary=lambda: gen.load_collibra_csv(path))
+    assert "5G = 5th Generation — The fifth generation of mobile networks." in prompts[0]
+    assert not offline_notes.warnings, offline_notes.warnings
+
+
+def test_load_collibra_csv_missing_degrades(tmp_path, notes):
+    missing = str(tmp_path / "nope.csv")
+    with pytest.raises(RuntimeError, match="saved Collibra glossary unreadable"):
+        gen.load_collibra_csv(missing)
+    prompts = []
+    out = run_descs(collibra_settings(), notes, prompts,
+                    load_glossary=lambda: gen.load_collibra_csv(missing))
+    assert out and notes.warnings and "Collibra glossary unavailable" in notes.warnings[0]
+    assert not any(GLOSSARY_BLOCK in p for p in prompts)
+
+
 # --- 10. abbreviations.csv hints ----------------------------------------------------------
 def test_abbreviation_hints(notes):
     prompts = []

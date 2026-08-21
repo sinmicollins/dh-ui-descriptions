@@ -79,7 +79,7 @@ def setup_page(title: str):
 def sidebar_connection():
     """Returns (environment, instance, source_project_id, repo_root)."""
     st.sidebar.header("Connection Settings")
-    environment = st.sidebar.selectbox("Environment", ["dv", "pr"])
+    environment = st.sidebar.selectbox("Environment", ["dv", "pr"], index=1)
     instance = st.sidebar.selectbox(
         "Datahub Instance", ["dh1", "dh2"],
         help="dh1 = enterprise, dh2 = lake. Also the file/job-id prefix.")

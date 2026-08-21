@@ -61,14 +61,15 @@ KNOWN_ERRORS = (
 FUELIX_API_URL = "https://api.fuelix.ai/v1/chat/completions"
 FUELIX_MODELS_URL = "https://api.fuelix.ai/v1/models"
 # Same service/username as the companion CLI so one stored key serves all tools.
-KEYRING_SERVICE = "gemini-3.1-flash-lite"
+KEYRING_SERVICE = "gemma-4-saif"
 KEYRING_USERNAME = "gpt_api_key"
 FUELIX_TIMEOUT_SECONDS = 120
-DEFAULT_MODEL = "mistral-small-3.2-24b"
+DEFAULT_MODEL = "gemma-4-saif"
 _NON_CHAT_PATTERNS = ("embedding", "whisper", "transcribe", "tts", "dall-e", "imagen", "-image")
 FALLBACK_MODELS = [
-    "mistral-small-3.2-24b", "claude-sonnet-4-6-anthropic", "gpt-5",
-    "gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.1-pro-preview",
+   "gemma-4-saif", "gemini-2.5-flash-ca", "gemini-2.5-pro-ca", 
+   "gpt-4o-mini-ca-east", "clarke-1.0", "tycho-1.0", "mistral-small-3.2-24b", 
+   "wasikan-qwen-3-next-80b", "wasikan-v2-2"
 ]
 _FUELIX_RETRY_STATUSES = (429, 500, 502, 503, 504)
 _FUELIX_MAX_ATTEMPTS = 3
@@ -81,7 +82,8 @@ SOURCE_PROJECTS = {
     ("pr", "dh2"): "cio-datahub-lake-pr-58ee8d",
 }
 MAX_SCAN_ID_LEN = 36
-ABBREV_FILE = os.path.join(os.path.dirname(__file__), "abbreviations.csv")
+REFERENCE_DIR = os.path.join(os.path.dirname(__file__), "reference")
+ABBREV_FILE = os.path.join(REFERENCE_DIR, "abbreviations.csv")
 # Orchestrator checkout: env override first, else a sibling of this repo.
 DEFAULT_REPO_ROOT = os.environ.get("DATAPLEX_REPO_ROOT") or os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "datahub-orchestrator-dataplex"))
