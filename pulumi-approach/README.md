@@ -1,77 +1,38 @@
-# Pulumi GCP Python Storage Bucket Template
+# Pulumi Deployment for Dataplex Rule Aspects
 
- A minimal Pulumi template for provisioning a Google Cloud Storage bucket using Python.
+Deploys the central rules spec (`../data-rules-aspects.yaml`) as a **Knowledge
+Catalog (f.k.a. Dataplex) entry aspect** using Pulumi.
 
- This template helps you get started with Pulumi and the `pulumi-gcp` provider to create a simple storage bucket and export its URL.
+`__main__.py`:
+1. loads `data-rules-aspects.yaml` from the repository root,
+2. rewrites the `dataplex-types.global.data-rules@Schema.*` aspect keys into
+   their fully-qualified `projects/dataplex-types/locations/global/...` form
+   and JSON-serializes each aspect's `data` payload,
+3. declares one `gcp.dataplex.Entry` that binds those aspects to the demo
+   BigQuery table (`demo1-311322.mobile_data.work_orders` — edit the
+   `entry_id` in `__main__.py` to target another table).
 
- ## When to Use
+## Prerequisites
 
- - You need a quick example of using Pulumi with Google Cloud in Python.
- - You want to manage a Google Cloud Storage bucket as code.
- - You’re looking for a minimal scaffold to build more complex GCP infrastructure.
+- Pulumi CLI, logged in.
+- GCP credentials (`gcloud auth application-default login` or
+  `GOOGLE_APPLICATION_CREDENTIALS`).
+- Python 3.12+.
 
- ## Prerequisites
+## Deploy
 
- - A Google Cloud account and a target GCP project.
- - Authentication set up via `gcloud auth login` or the `GOOGLE_APPLICATION_CREDENTIALS` environment variable.
- - Python 3.7 or later installed on your machine.
- - Pulumi CLI installed and logged in to your Pulumi account.
+```bash
+cd pulumi-approach
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
 
- ## Usage
+pulumi stack init <your-org-or-user>/dev
+pulumi config set gcp:project demo1-311322
+pulumi config set gcp:region us-central1
 
- Run the following command to scaffold a new project from this template:
+pulumi preview
+pulumi up
+```
 
- ```bash
- pulumi new gcp-python
- ```
-
- Follow the interactive prompts:
- - **Project Name**: Your project name.
- - **Project Description**: A short description of your project.
- - **gcp:project**: The ID of the Google Cloud project where resources will be created.
-
- After the project is generated, navigate into your project directory and deploy:
-
- ```bash
- cd <project-name>
- pulumi up
- ```
-
- Confirm the changes to provision your storage bucket.
-
- ## Project Layout
-
- ```
- .
- ├── __main__.py        # Pulumi program defining resources
- ├── Pulumi.yaml        # Project configuration and template metadata
- └── requirements.txt   # Python dependencies for Pulumi and GCP
- ```
-
- ## Configuration
-
- - **gcp:project**: (Required) The Google Cloud project ID where resources will be created.
-
- ## Resources Created
-
- - **Storage Bucket** (`pulumi_gcp.storage.Bucket`): A bucket named `my-bucket` in the `US` location.
-
- ## Outputs
-
- - **bucket_name**: The URL of the created storage bucket.
-
- ## Next Steps
-
- - Modify `__main__.py` to customize the bucket:
-   - Change the bucket name.
-   - Adjust the `location` or add bucket labels and IAM policies.
- - Add more GCP resources such as Pub/Sub topics, Compute instances, or BigQuery datasets.
- - Integrate with CI/CD pipelines using `pulumi preview` and `pulumi up --yes`.
- - Explore the [Pulumi GCP Provider Documentation](https://www.pulumi.com/registry/packages/gcp/) for more examples.
-
- ## Need Help?
-
- - Pulumi Docs: https://www.pulumi.com/docs/
- - GCP Provider Docs: https://www.pulumi.com/registry/packages/gcp/
- - Community Slack: https://slack.pulumi.com/
- - GitHub Issues: https://github.com/pulumi/pulumi/issues
+See the repository root README (Workflow 2) for how this fits the overall
+GitOps flow.

@@ -1,7 +1,10 @@
-streamlit
-google-cloud-bigquery
-PyYAML
-requests
-keyring
-openpyxl
-google-cloud-secret-manager
+streamlit==1.60.0
+pandas==3.0.3
+google-cloud-bigquery==3.42.2
+google-api-core==2.33.0
+google-auth==2.56.2
+google-cloud-secret-manager==2.30.0
+PyYAML==6.0.3
+requests==2.34.2
+keyring==25.7.0
+openpyxl==3.1.5

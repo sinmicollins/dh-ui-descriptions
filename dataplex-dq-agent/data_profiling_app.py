@@ -8,27 +8,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dataplex Data Profiling Scan (dataplex-dp) spec generator.
+"""Dataplex Data Profiling Scan (dataplex-dp) spec generator — UI shell.
 
 Sources table metadata from BigQuery INFORMATION_SCHEMA (no Sheets access) and
-mirrors the CLI's field-resolution cascade. Shared plumbing and the gated YAML
-validation/deploy path live in dq_common."""
-import glob
-import json
+mirrors the CLI's field-resolution cascade. The DPS logic lives in dq_core
+(streamlit-free, dependency-injected); the shared UI/caching layer in dq_ui."""
+import logging
 import os
 import re
 
 import pandas as pd
 import streamlit as st
 
-from dq_common import (
-    MAX_SCAN_ID_LEN, build_scan_id, call_fuelix, collect_repo_scan_ids,
-    fetch_table_metadata, load_yaml, parse_llm_json,
-    pick_audit_column, read_scans, read_target, render_file_header,
-    render_preview_and_deploy, resolve_scan_id, select_tables, setup_page,
-    show_target, sidebar_connection, sidebar_fuelix, sidebar_scan_settings,
-    validate_scan_id, yaml_quote,
+import dq_core
+from dq_ui import (
+    fetch_table_metadata, read_target, render_preview_and_deploy, select_tables,
+    setup_page, show_target, sidebar_connection, sidebar_fuelix,
+    sidebar_scan_settings,
 )
+
+dq_core.configure_logging()
+logger = logging.getLogger(__name__)
 
 # `field` is typed by hand and lands inside a SQL row_filter, so it is held to
 # the BigQuery column-identifier charset before being rendered.
@@ -61,97 +61,8 @@ job_prefix = instance
 output_filename = f"{instance}_dps_{source_dataset_id}.yaml"
 
 
-# --- Field resolution (metadata helpers shared via dq_common) -------------------
-def resolve_field(meta: dict):
-    """The CLI's 6-step cascade. Returns (field, source_note); an empty field
-    means manual review (the user can still type one in the editor)."""
-    pc, pct, pf = (meta["partition_column"], meta["partition_column_type"],
-                   meta["require_partition_filter"])
-    if pct == "TIMESTAMP" and pc:                       # 1. cheapest: pruning
-        return pc, "partition column (TIMESTAMP)"
-    if pf:                                              # 2-3. filter required
-        if pct in ("DATETIME", "DATE") and pc:
-            return pc, f"partition column ({pct}, filter required)"
-        return "", (f"require_partition_filter=TRUE but partition column type "
-                    f"{pct or 'unknown'} is non-temporal — manual review")
-    audit = pick_audit_column(meta["temporal_columns"])
-    if audit:                                           # 4. audit column
-        return audit, "audit column"
-    if pct in ("DATETIME", "DATE") and pc:              # 5. temporal partition
-        return pc, f"partition column ({pct})"
-    return "", "no temporal partition or audit column found — manual review"
-
-
-# --- Repo inventory (DPS-specific) -----------------------------------------------
-def load_repo_dps_tables(gov_dir: str, prefix: str) -> dict:
-    """{(project, dataset, table): job_id} across every DPS file — used to
-    skip tables that already have a profiling scan (additive-only)."""
-    out = {}
-    for path in sorted(glob.glob(os.path.join(gov_dir, f"{prefix}_dps_*.yaml"))):
-        for job_id, block in read_scans(path, "dataplex-dp").items():
-            src = block.get("data_source") if isinstance(block, dict) else None
-            if not isinstance(src, dict):
-                continue
-            key = tuple(str(src.get(k) or "").strip()
-                        for k in ("project_id", "dataset_id", "table_id"))
-            if all(key) and key not in out:
-                out[key] = job_id
-    return out
-
-
-def read_existing_cron(yaml_path: str) -> str:
-    """Global cron of an existing DPS file ('' if unreadable/absent)."""
-    node = load_yaml(yaml_path)
-    for key in ("governance", "consumer-governance", "dataplex-dp",
-                "execution_spec", "trigger", "schedule"):
-        node = node.get(key) if isinstance(node, dict) else None
-    return str(node.get("cron") or "").strip() if isinstance(node, dict) else ""
-
-
-# --- YAML block rendering -----------------------------------------------------------
-def render_scan_block(job_id, project_id_, dataset_id_, table_id_, field_column, cron) -> str:
-    # DATE() is polymorphic over TIMESTAMP/DATETIME/DATE, so one row_filter
-    # template covers every resolvable field type.
-    row_filter = f"DATE({field_column}) = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)"
-    return "\n".join([
-        f"        {job_id}:",
-        "          data_source:",
-        f"            project_id: {yaml_quote(project_id_)}",
-        f"            dataset_id: {yaml_quote(dataset_id_)}",
-        f"            table_id: {yaml_quote(table_id_)}",
-        "          execution_spec:",
-        f"            field: {yaml_quote(field_column)}",
-        "            trigger:",
-        "              schedule:",
-        f"                cron: {yaml_quote(cron)}",
-        "          data_profile_spec:",
-        f"            row_filter: {yaml_quote(row_filter)}",
-    ])
-
-
-# --- LLM rename fallback (validated outside the model) --------------------------------
-def llm_rename_scan_ids(failing: list, forbidden: set) -> dict:
-    """{table: new_id}, keeping only suggestions that pass validate_scan_id."""
-    system_instruction = (
-        "You rename BigQuery Dataplex scan job ids that violate naming rules. "
-        "Return ONLY a JSON object mapping table_name to a new job id. Every id must:\n"
-        f"1. be <= {MAX_SCAN_ID_LEN} characters;\n"
-        f"2. match ^{job_prefix}_[a-z0-9_]+$ (start with the literal prefix '{job_prefix}_');\n"
-        "3. not end with an underscore or hyphen;\n"
-        "4. not collide with the forbidden ids nor with each other.\n"
-        "Abbreviate tokens of the dataset/table name rather than inventing unrelated words.")
-    prompt = json.dumps({"dataset": source_dataset_id, "rows": failing,
-                         "forbidden_ids": sorted(forbidden)}, separators=(",", ":"))
-    data = parse_llm_json(call_fuelix(system_instruction, prompt, fuelix_api_key, model_name))
-    if not isinstance(data, dict):
-        return {}
-    accepted, taken = {}, set(forbidden)
-    for row in failing:
-        cand = str(data.get(row["table"], "")).strip()
-        if validate_scan_id(cand, job_prefix, taken)[0]:
-            accepted[row["table"]] = cand
-            taken.add(cand)
-    return accepted
+def call_llm(system, user):
+    return dq_core.call_fuelix(system, user, fuelix_api_key, model_name)
 
 
 # --- UI flow ----------------------------------------------------------------------------
@@ -170,11 +81,11 @@ if table_names:
             with st.spinner("Fetching INFORMATION_SCHEMA metadata..."):
                 meta_by_table = fetch_table_metadata(
                     source_project_id, source_dataset_id, bq_location, tuple(table_names))
-            existing_tables = load_repo_dps_tables(governance_dir, job_prefix)
-            forbidden = collect_repo_scan_ids(governance_dir, job_prefix)
+            existing_tables = dq_core.load_repo_dps_tables(governance_dir, job_prefix)
+            forbidden = dq_core.collect_repo_scan_ids(governance_dir, job_prefix)
             plan, assigned, llm_candidates = [], set(), []
             for table in table_names:
-                field, source = resolve_field(meta_by_table[table])
+                field, source = dq_core.resolve_field(meta_by_table[table])
                 repo_key = (source_project_id, source_dataset_id, table)
                 if repo_key in existing_tables:
                     plan.append({"table": table, "scan_id": existing_tables[repo_key],
@@ -182,8 +93,8 @@ if table_names:
                                  "status": "skip: profiling scan already exists",
                                  "locked": True})
                     continue
-                scan_id = build_scan_id(job_prefix, source_dataset_id, table)
-                ok, reason = validate_scan_id(scan_id, job_prefix, forbidden | assigned)
+                scan_id = dq_core.build_scan_id(job_prefix, source_dataset_id, table)
+                ok, reason = dq_core.validate_scan_id(scan_id, job_prefix, forbidden | assigned)
                 if ok:
                     assigned.add(scan_id)
                 else:
@@ -197,9 +108,12 @@ if table_names:
             if llm_candidates and use_llm_rename and fuelix_api_key:
                 with st.spinner(f"Renaming {len(llm_candidates)} scan id(s) via {model_name}..."):
                     try:
-                        renames = llm_rename_scan_ids(llm_candidates, forbidden | assigned)
-                    except Exception as e:
+                        renames = dq_core.llm_rename_scan_ids(
+                            llm_candidates, forbidden | assigned, prefix=job_prefix,
+                            dataset=source_dataset_id, call_llm=call_llm)
+                    except dq_core.KNOWN_ERRORS as e:
                         renames = {}
+                        logger.warning("LLM rename fallback failed: %s", e)
                         st.warning(f"LLM rename fallback failed ({e}); "
                                    "falling back to deterministic ids.")
                 for row in plan:
@@ -213,20 +127,21 @@ if table_names:
             unresolved = {c["table"] for c in llm_candidates}
             for row in plan:
                 if row["table"] in unresolved and row["status"].startswith("skip:"):
-                    new_id = resolve_scan_id(job_prefix, source_dataset_id,
-                                             row["table"], forbidden | assigned)
+                    new_id = dq_core.resolve_scan_id(job_prefix, source_dataset_id,
+                                                     row["table"], forbidden | assigned)
                     row["scan_id"], row["status"] = new_id, (
                         "ok (auto-renamed)" if row["field"] else NEEDS_FIELD)
                     assigned.add(new_id)
             st.session_state["dps_plan"] = plan
-        except Exception as e:
+        except dq_core.KNOWN_ERRORS as e:
+            logger.exception("table analysis failed")
             st.error(f"Error analyzing tables: {e}")
 
 if "dps_plan" in st.session_state:
     plan = st.session_state["dps_plan"]
     st.write("---")
     st.write("### Step 2: Review Plan (edit `field` to override)")
-    st.caption(f"Scan-id rules: length <= {MAX_SCAN_ID_LEN}, `^{job_prefix}_[a-z0-9_]+$`, "
+    st.caption(f"Scan-id rules: length <= {dq_core.MAX_SCAN_ID_LEN}, `^{job_prefix}_[a-z0-9_]+$`, "
                "no trailing separator, unique across the repo and this run. `field` drives "
                "execution_spec.field and the daily incremental row_filter.")
     edited = st.data_editor(
@@ -238,7 +153,7 @@ if "dps_plan" in st.session_state:
     file_exists, existing_text = read_target(target_path)
 
     # Additive-only: an existing file's cron is reused for appended scans.
-    effective_cron = (read_existing_cron(target_path) if file_exists else "") or scan_cron
+    effective_cron = (dq_core.read_existing_cron(target_path) if file_exists else "") or scan_cron
     if file_exists and effective_cron != scan_cron:
         st.info(f"Existing file cron `{effective_cron}` reused for appended scans.")
 
@@ -254,9 +169,9 @@ if "dps_plan" in st.session_state:
         elif not FIELD_RE.match(field):
             skipped.append((orig["table"], f"field {field!r} is not a valid column name"))
         else:
-            blocks.append(render_scan_block(orig["scan_id"], source_project_id,
-                                            source_dataset_id, orig["table"],
-                                            field, effective_cron))
+            blocks.append(dq_core.render_dps_scan_block(
+                orig["scan_id"], source_project_id, source_dataset_id,
+                orig["table"], field, effective_cron))
             scan_ids.append(orig["scan_id"])
 
     if blocks:
@@ -271,6 +186,7 @@ if "dps_plan" in st.session_state:
     show_target(environment, output_filename, target_path, file_exists, "dataplex-dp")
     render_preview_and_deploy(
         existing_text,
-        render_file_header("dataplex-dp", effective_cron, catalog_publishing_enabled, export_dataset),
+        dq_core.render_file_header("dataplex-dp", effective_cron,
+                                   catalog_publishing_enabled, export_dataset),
         blocks, target_path, governance_dir, output_filename, file_exists,
         scan_ids=scan_ids, top_key="dataplex-dp")

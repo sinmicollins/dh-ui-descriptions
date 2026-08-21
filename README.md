@@ -14,12 +14,15 @@ By leveraging metadata aspects bound directly to Catalog entry schemas instead o
 │       ├── dataplex-dq.yml      # CI/CD: Deploys aspects & schedules daily quality scans
 │       └── dataplex-profile.yml # CI/CD: Schedules daily data profiling scans
 ├── dataplex-dq-agent/           # Streamlit-based GenAI scan generator apps
-│   ├── data_quality_app.py      # DQ scan (dataplex-dq) generator with Human-in-the-loop validation
-│   ├── data_profiling_app.py    # Data profiling scan (dataplex-dp) generator
-│   ├── dq_common.py             # Shared chassis: FuelIX access, scan ids, YAML quoting, UI blocks
-│   ├── benchmarks/              # Fixtures, golden rule sets, and benchmark results/report
+│   ├── data_quality_app.py      # DQ scan (dataplex-dq) generator UI with Human-in-the-loop validation
+│   ├── data_profiling_app.py    # Data profiling scan (dataplex-dp) generator UI
+│   ├── dq_generation.py         # DQ pipeline: profiling, policy-tag firewall, descriptions, rule YAML (streamlit-free)
+│   ├── dq_core.py               # Core: FuelIX client, BigQuery metadata, scan ids, YAML engine, DPS logic (streamlit-free)
+│   ├── dq_ui.py                 # Streamlit layer: cached wrappers + shared page/sidebar/deploy blocks
+│   ├── tests/                   # Pytest behavior suite (dependency-injected fakes, no cloud access needed)
+│   ├── descriptions/            # Generated table/column description workbooks (data — do not delete)
 │   ├── abbreviations.csv        # Token abbreviations used to fit scan ids in 36 chars
-│   └── requirements.txt         # App package dependencies
+│   └── requirements.txt         # Pinned app dependencies (requirements-dev.txt adds pytest)
 ├── pulumi-approach/             # Infrastructure-as-Code deployment project
 │   ├── __main__.py              # Main Pulumi script (loads rules spec dynamically)
 │   ├── Pulumi.yaml
@@ -36,19 +39,27 @@ By leveraging metadata aspects bound directly to Catalog entry schemas instead o
 ## 🚀 Workflows & Getting Started
 
 ### Workflow 1: Generate Rules Specs via the GenAI Agent
-The **Dataplex Auto-DQ Spec Generator Agent** is a Streamlit app that reads historical column profiling metrics directly from BigQuery, uses an LLM via the **FuelIX gateway** (model picker in the sidebar; default `wasikan-qwen-3-next-80b`) to propose rule configurations, accepts human feedback/spreadsheets, and generates your YAML aspects.
+The **Dataplex Auto-DQ Spec Generator Agent** is a Streamlit app that reads historical column profiling metrics directly from BigQuery, uses an LLM via the **FuelIX gateway** (model picker in the sidebar; default `mistral-small-3.2-24b`) to propose rule configurations, accepts human feedback/spreadsheets, and generates your scan YAML.
 
 #### Setup & Launch:
 ```bash
+python3 -m venv .venv                        # at the repository root
+source .venv/bin/activate                    # Windows: .venv\Scripts\activate
+pip install -r dataplex-dq-agent/requirements.txt
 cd dataplex-dq-agent
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
 streamlit run data_quality_app.py     # DQ rules/scans
 streamlit run data_profiling_app.py   # data profiling scans
 ```
 * **Step 1: Generate Action Plan**: Queries BigQuery profiling tables and outputs suggested rules with clear statistical justifications.
-* **Step 2: Human-in-the-Loop Feedback**: Review suggestions, upload logic sheets (PDF/CSV/Excel/TXT), type custom overrides, and output the final `data-rules-aspects.yaml` file.
+* **Step 2: Human-in-the-Loop Feedback**: Review suggestions, upload logic sheets (PDF/CSV/Excel/TXT), type custom overrides, and generate the final scan YAML (`<instance>_dqs_<dataset>.yaml` / `<instance>_dps_<dataset>.yaml`), written into the governance folder of your **orchestrator repo** checkout (`<repo>/edemm/<env>/governance/` — set the repo root in the sidebar, or via the `DATAPLEX_REPO_ROOT` environment variable).
+
+Diagnostics log to stderr; set `DQ_LOG_LEVEL=DEBUG` for verbose output.
+
+#### Run the test suite (no GCP/FuelIX access required):
+```bash
+pip install -r dataplex-dq-agent/requirements-dev.txt
+pytest dataplex-dq-agent/tests
+```
 
 ---
 

@@ -8,22 +8,54 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared helpers for the Dataplex DQ/DPS spec-generator Streamlit apps:
-FuelIX access, cached BigQuery client, the scan-id build/validate cascade,
-governance-YAML inventory, YAML quoting/repair/validation, and shared UI."""
+"""Streamlit-free core for the Dataplex DQ/DPS spec generators: FuelIX client,
+BigQuery metadata access, the scan-id build/validate cascade, governance-YAML
+inventory, YAML quoting/repair/validation, and the DPS field/render logic.
+
+BigQuery clients and LLM callables are passed in by the caller (dependency
+injection); the Streamlit wrappers/caches live in dq_ui, the DQ-app generation
+pipeline in dq_generation."""
 import csv
+import functools
 import glob
 import itertools
 import json
+import logging
 import math
 import os
 import re
+import sys
+import time
 
+import google.auth.exceptions
 import keyring
+import keyring.errors
 import requests
-import streamlit as st
 import yaml
+from google.api_core.exceptions import GoogleAPIError
 from google.cloud import bigquery
+
+logger = logging.getLogger(__name__)
+
+
+def configure_logging() -> None:
+    """Idempotent app-startup logging: stderr, level from DQ_LOG_LEVEL
+    (default INFO). basicConfig is a no-op once the root logger has handlers,
+    so Streamlit reruns don't stack duplicate handlers."""
+    logging.basicConfig(level=os.environ.get("DQ_LOG_LEVEL", "INFO").upper(),
+                        stream=sys.stderr,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+
+# Failure families the UI boundaries turn into on-page messages instead of a
+# crashed page. Neither logs nor messages ever carry sample rows, description
+# text, or credentials — the policy-tag firewall extends to logging.
+KNOWN_ERRORS = (
+    GoogleAPIError,                          # BigQuery / Secret Manager calls
+    google.auth.exceptions.GoogleAuthError,  # ADC/credential resolution
+    requests.RequestException, keyring.errors.KeyringError, yaml.YAMLError,
+    RuntimeError, ValueError, KeyError, IndexError, TypeError, OSError,
+)
 
 # --- FuelIX (TELUS LLM gateway) ------------------------------------------------
 FUELIX_API_URL = "https://api.fuelix.ai/v1/chat/completions"
@@ -38,6 +70,8 @@ FALLBACK_MODELS = [
     "mistral-small-3.2-24b", "claude-sonnet-4-6-anthropic", "gpt-5",
     "gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.1-pro-preview",
 ]
+_FUELIX_RETRY_STATUSES = (429, 500, 502, 503, 504)
+_FUELIX_MAX_ATTEMPTS = 3
 
 # --- Dataplex conventions --------------------------------------------------------
 SOURCE_PROJECTS = {
@@ -48,14 +82,9 @@ SOURCE_PROJECTS = {
 }
 MAX_SCAN_ID_LEN = 36
 ABBREV_FILE = os.path.join(os.path.dirname(__file__), "abbreviations.csv")
-DEFAULT_REPO_ROOT = r"C:\Users\T976160\Desktop\Git Repos\datahub-orchestrator-dataplex"
-
-_APP_CSS = """<style>
-.main-header {font-size: 2.2rem; color: #1E3A8A; font-weight: bold; margin-bottom: 0.5rem;}
-.stButton>button {background-color: #1E3A8A; color: white; font-weight: bold;
-                  border-radius: 0.375rem; border: none;}
-.stButton>button:hover {background-color: #1E40AF; color: white;}
-</style>"""
+# Orchestrator checkout: env override first, else a sibling of this repo.
+DEFAULT_REPO_ROOT = os.environ.get("DATAPLEX_REPO_ROOT") or os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "datahub-orchestrator-dataplex"))
 
 
 # --- FuelIX access -----------------------------------------------------------------
@@ -66,13 +95,18 @@ def get_fuelix_api_key() -> str:
         return env_key.strip()
     try:
         return (keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME) or "").strip()
-    except Exception:
+    except (keyring.errors.KeyringError, OSError) as e:
+        logger.warning("keyring read failed: %s", e)
         return ""
 
 
-def call_fuelix(system_instruction, user_content, api_key, model, temperature=0.0) -> str:
-    """One chat-completions call. Reasoning models reject non-default
-    temperature with a 400; that case is retried once without the field."""
+def call_fuelix(system_instruction, user_content, api_key, model, temperature=0.0,
+                *, http=requests, sleep=time.sleep) -> str:
+    """One chat-completions call with bounded retries for transient failures
+    (429/5xx/timeouts, exponential backoff). Reasoning models reject
+    non-default temperature with a 400; that case is retried once without the
+    field and does not consume a network attempt. `http`/`sleep` are
+    dependency-injection seams for tests."""
     if not api_key:
         raise RuntimeError("No FuelIX API key set. Enter one in the sidebar.")
     payload = {
@@ -81,21 +115,47 @@ def call_fuelix(system_instruction, user_content, api_key, model, temperature=0.
                      {"role": "user", "content": user_content}],
         "temperature": temperature,
     }
-    for attempt in (1, 2):
-        resp = requests.post(
-            FUELIX_API_URL, json=payload, timeout=FUELIX_TIMEOUT_SECONDS,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        )
-        if (attempt == 1 and resp.status_code == 400
+    attempt, temp_retried, started = 1, False, time.monotonic()
+    while True:
+        try:
+            resp = http.post(
+                FUELIX_API_URL, json=payload, timeout=FUELIX_TIMEOUT_SECONDS,
+                headers={"Authorization": f"Bearer {api_key}",
+                         "Content-Type": "application/json"},
+            )
+        except (requests.Timeout, requests.ConnectionError) as e:
+            logger.warning("FuelIX %s attempt %d/%d failed: %s", model, attempt,
+                           _FUELIX_MAX_ATTEMPTS, type(e).__name__)
+            if attempt >= _FUELIX_MAX_ATTEMPTS:
+                raise RuntimeError(
+                    f"FuelIX unreachable after {attempt} attempts: {e}") from e
+            sleep(2 ** (attempt - 1))
+            attempt += 1
+            continue
+        if (resp.status_code == 400 and not temp_retried
                 and "temperature" in resp.text and "temperature" in payload):
-            del payload["temperature"]
+            del payload["temperature"]  # free retry: not a network failure
+            temp_retried = True
+            continue
+        if resp.status_code in _FUELIX_RETRY_STATUSES and attempt < _FUELIX_MAX_ATTEMPTS:
+            logger.warning("FuelIX %s HTTP %d on attempt %d/%d — retrying", model,
+                           resp.status_code, attempt, _FUELIX_MAX_ATTEMPTS)
+            sleep(2 ** (attempt - 1))
+            attempt += 1
             continue
         if not resp.ok:
             # Surface the gateway's own message (context-length, bad model, ...)
             # instead of raise_for_status()'s body-less HTTPError.
             raise RuntimeError(f"FuelIX {resp.status_code}: {resp.text[:300]}")
-        return resp.json()["choices"][0]["message"]["content"]
-    raise RuntimeError("call_fuelix: retry loop exhausted")
+        try:
+            body = resp.json()
+            content = body["choices"][0]["message"]["content"]
+        except (ValueError, KeyError, IndexError, TypeError) as e:
+            raise RuntimeError(f"FuelIX returned an unexpected response shape: {e}") from e
+        logger.info("FuelIX %s ok in %.1fs (attempt %d, prompt_chars=%d, usage=%s)",
+                    model, time.monotonic() - started, attempt,
+                    len(system_instruction) + len(user_content), body.get("usage"))
+        return content
 
 
 def is_chat_model(model_id: str) -> bool:
@@ -103,18 +163,18 @@ def is_chat_model(model_id: str) -> bool:
     return bool(mid) and not any(p in mid for p in _NON_CHAT_PATTERNS)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_fuelix_models(api_key: str) -> list:
+def fetch_fuelix_models(api_key: str, http=requests) -> list:
     """Sorted chat-model ids from /v1/models; [] on any failure."""
     if not api_key:
         return []
     try:
-        resp = requests.get(FUELIX_MODELS_URL, timeout=30,
-                            headers={"Authorization": f"Bearer {api_key}"})
+        resp = http.get(FUELIX_MODELS_URL, timeout=30,
+                        headers={"Authorization": f"Bearer {api_key}"})
         resp.raise_for_status()
         ids = (m.get("id") for m in resp.json().get("data", []) if m.get("id"))
         return sorted(m for m in ids if is_chat_model(m))
-    except Exception:
+    except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError) as e:
+        logger.warning("FuelIX model list fetch failed: %s", e)
         return []
 
 
@@ -138,19 +198,35 @@ def parse_llm_json(raw: str):
     return None
 
 
-# --- BigQuery (cached) ----------------------------------------------------------------
-@st.cache_resource(show_spinner=False)
-def get_bq_client(project: str, location: str) -> bigquery.Client:
-    return bigquery.Client(project=project, location=location)
+# --- BigQuery ----------------------------------------------------------------------
+_BQ_IDENT_RES = {
+    "project": re.compile(r"^[a-z0-9][a-z0-9.:-]{0,62}$"),
+    "dataset": re.compile(r"^[A-Za-z0-9_]{1,1024}$"),
+    "table": re.compile(r"^[A-Za-z0-9_]{1,1024}$"),
+    "column": re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,299}$"),
+}
 
 
-@st.cache_data(ttl="15m", show_spinner=False)
-def list_dataset_tables(project: str, dataset: str, location: str) -> list:
+def bq_ident(value, kind: str) -> str:
+    """`value` validated against the BigQuery lexical rules for `kind`.
+    Identifier slots (project/dataset/table/column names) cannot be query
+    parameters, so anything user-typed is allowlisted before being spliced
+    into SQL. Deliberately narrower than BigQuery's exotic flexible names:
+    the datahub estate is snake_case, and a clear early error beats an
+    injection surface."""
+    value = str(value or "")
+    if not _BQ_IDENT_RES[kind].fullmatch(value):
+        raise ValueError(f"invalid BigQuery {kind} identifier: {value!r}")
+    return value
+
+
+def list_dataset_tables(client, project: str, dataset: str) -> list:
+    project, dataset = bq_ident(project, "project"), bq_ident(dataset, "dataset")
     query = f"""
     SELECT table_name FROM `{project}.{dataset}.INFORMATION_SCHEMA.TABLES`
     WHERE table_type = 'BASE TABLE' ORDER BY table_name
     """
-    return [row["table_name"] for row in get_bq_client(project, location).query(query)]
+    return [row["table_name"] for row in client.query(query)]
 
 
 # Audit-column candidates, highest priority first (matched case-insensitively
@@ -163,15 +239,14 @@ AUDIT_PRIORITY = [
 AUDIT_REGEX = re.compile(r"(updt|update|audit|source_ts)", re.IGNORECASE)
 
 
-@st.cache_data(ttl="15m", show_spinner=False)
-def fetch_table_metadata(project: str, dataset: str, location: str, tables: tuple) -> dict:
+def fetch_table_metadata(client, project: str, dataset: str, tables: tuple) -> dict:
     """{table: {partition_column, partition_column_type, require_partition_filter,
     temporal_columns}} from INFORMATION_SCHEMA. Both jobs are submitted before
     either result is read, so they run concurrently."""
+    project, dataset = bq_ident(project, "project"), bq_ident(dataset, "dataset")
     meta = {t: {"partition_column": "", "partition_column_type": "",
                 "require_partition_filter": False, "temporal_columns": []}
             for t in tables}
-    client = get_bq_client(project, location)
     job_config = bigquery.QueryJobConfig(
         query_parameters=[bigquery.ArrayQueryParameter("tables", "STRING", list(tables))])
     cols_job = client.query(f"""
@@ -215,9 +290,10 @@ def pick_audit_column(temporal_columns: list) -> str:
 
 
 # --- Scan-id build + validation ---------------------------------------------------------
-@st.cache_data(show_spinner=False)
+@functools.lru_cache(maxsize=8)
 def _load_abbreviations(path: str, mtime: float) -> dict:
-    """full_word -> abbreviation (lowercased); empty value = drop the token."""
+    """full_word -> abbreviation (lowercased); empty value = drop the token.
+    lru_cache returns a shared object — callers treat it as read-only."""
     abbrev = {}
     with open(path, encoding="utf-8-sig", newline="") as f:
         for i, row in enumerate(csv.reader(f)):
@@ -308,7 +384,7 @@ def resolve_scan_id(prefix: str, dataset: str, table: str, forbidden: set,
 
 
 # --- Governance-YAML inventory (mtime-cached) ----------------------------------------------
-@st.cache_data(show_spinner=False, max_entries=256)
+@functools.lru_cache(maxsize=256)
 def _load_yaml(path: str, mtime: float):
     try:
         with open(path, encoding="utf-8") as f:
@@ -318,7 +394,8 @@ def _load_yaml(path: str, mtime: float):
 
 
 def load_yaml(path: str):
-    """Parsed YAML (None if unreadable), cached until the file's mtime changes."""
+    """Parsed YAML (None if unreadable), cached until the file's mtime changes.
+    lru_cache returns a shared object — callers treat it as read-only."""
     try:
         return _load_yaml(path, os.path.getmtime(path))
     except OSError:
@@ -451,164 +528,92 @@ def render_file_header(top_key: str, cron, publishing, export_ds) -> str:
     )
 
 
-# --- Shared UI blocks --------------------------------------------------------------------------
-def setup_page(title: str):
-    st.set_page_config(page_title=title, layout="wide")
-    st.markdown(_APP_CSS, unsafe_allow_html=True)
-    st.write(f'<div class="main-header">{title}</div>', unsafe_allow_html=True)
+# --- DPS (data-profiling scan) logic ------------------------------------------------------
+def resolve_field(meta: dict):
+    """The CLI's 6-step cascade. Returns (field, source_note); an empty field
+    means manual review (the user can still type one in the editor)."""
+    pc, pct, pf = (meta["partition_column"], meta["partition_column_type"],
+                   meta["require_partition_filter"])
+    if pct == "TIMESTAMP" and pc:                       # 1. cheapest: pruning
+        return pc, "partition column (TIMESTAMP)"
+    if pf:                                              # 2-3. filter required
+        if pct in ("DATETIME", "DATE") and pc:
+            return pc, f"partition column ({pct}, filter required)"
+        return "", (f"require_partition_filter=TRUE but partition column type "
+                    f"{pct or 'unknown'} is non-temporal — manual review")
+    audit = pick_audit_column(meta["temporal_columns"])
+    if audit:                                           # 4. audit column
+        return audit, "audit column"
+    if pct in ("DATETIME", "DATE") and pc:              # 5. temporal partition
+        return pc, f"partition column ({pct})"
+    return "", "no temporal partition or audit column found — manual review"
 
 
-def sidebar_connection():
-    """Returns (environment, instance, source_project_id, repo_root)."""
-    st.sidebar.header("Connection Settings")
-    environment = st.sidebar.selectbox("Environment", ["dv", "pr"])
-    instance = st.sidebar.selectbox(
-        "Datahub Instance", ["dh1", "dh2"],
-        help="dh1 = enterprise, dh2 = lake. Also the file/job-id prefix.")
-    source_project_id = SOURCE_PROJECTS[(environment, instance)]
-    st.sidebar.text_input("Source Project (derived)", value=source_project_id, disabled=True)
-    repo_root = st.sidebar.text_input(
-        "Dataplex Repo Root", value=DEFAULT_REPO_ROOT,
-        help="YAML is written under <repo>/edemm/<env>/governance/.")
-    return environment, instance, source_project_id, repo_root
+def load_repo_dps_tables(gov_dir: str, prefix: str) -> dict:
+    """{(project, dataset, table): job_id} across every DPS file — used to
+    skip tables that already have a profiling scan (additive-only)."""
+    out = {}
+    for path in sorted(glob.glob(os.path.join(gov_dir, f"{prefix}_dps_*.yaml"))):
+        for job_id, block in read_scans(path, "dataplex-dp").items():
+            src = block.get("data_source") if isinstance(block, dict) else None
+            if not isinstance(src, dict):
+                continue
+            key = tuple(str(src.get(k) or "").strip()
+                        for k in ("project_id", "dataset_id", "table_id"))
+            if all(key) and key not in out:
+                out[key] = job_id
+    return out
 
 
-def sidebar_fuelix(model_label: str, model_help: str):
-    """FuelIX key management + model picker. Returns (api_key, model_name)."""
-    api_key = get_fuelix_api_key()
-    if not api_key:
-        st.sidebar.warning("No FuelIX API key found — enter one below.")
-    new_key = st.sidebar.text_input("FuelIX API Key", type="password",
-                                    help="Saved to the OS keyring and reused.")
-    if new_key:
-        try:
-            keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, new_key.strip())
-            api_key = new_key.strip()
-        except Exception as e:
-            st.sidebar.error(f"Keyring save failed: {e}")
-    if st.sidebar.button("Refresh model list"):
-        fetch_fuelix_models.clear()
-    live = fetch_fuelix_models(api_key)
-    models = list(live) or list(FALLBACK_MODELS)
-    if DEFAULT_MODEL not in models:
-        models.insert(0, DEFAULT_MODEL)
-    model = st.sidebar.selectbox(model_label, models,
-                                 index=models.index(DEFAULT_MODEL), help=model_help)
-    if api_key and not live:
-        st.sidebar.caption("Models endpoint unreachable — using fallback list.")
-    return api_key, model
+def read_existing_cron(yaml_path: str) -> str:
+    """Global cron of an existing DPS file ('' if unreadable/absent)."""
+    node = load_yaml(yaml_path)
+    for key in ("governance", "consumer-governance", "dataplex-dp",
+                "execution_spec", "trigger", "schedule"):
+        node = node.get(key) if isinstance(node, dict) else None
+    return str(node.get("cron") or "").strip() if isinstance(node, dict) else ""
 
 
-def sidebar_scan_settings(header: str, cron_default: str, cron_help: str):
-    """Returns (cron, export_dataset, publishing_enabled)."""
-    st.sidebar.header(header)
-    cron = st.sidebar.text_input("Scan Schedule (cron)", value=cron_default, help=cron_help)
-    export_ds = st.sidebar.text_input("BigQuery Export Dataset", value="default")
-    publishing = st.sidebar.checkbox("Catalog Publishing Enabled", value=True)
-    return cron, export_ds, publishing
+def render_dps_scan_block(job_id, project_id_, dataset_id_, table_id_, field_column, cron) -> str:
+    # DATE() is polymorphic over TIMESTAMP/DATETIME/DATE, so one row_filter
+    # template covers every resolvable field type.
+    row_filter = f"DATE({field_column}) = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)"
+    return "\n".join([
+        f"        {job_id}:",
+        "          data_source:",
+        f"            project_id: {yaml_quote(project_id_)}",
+        f"            dataset_id: {yaml_quote(dataset_id_)}",
+        f"            table_id: {yaml_quote(table_id_)}",
+        "          execution_spec:",
+        f"            field: {yaml_quote(field_column)}",
+        "            trigger:",
+        "              schedule:",
+        f"                cron: {yaml_quote(cron)}",
+        "          data_profile_spec:",
+        f"            row_filter: {yaml_quote(row_filter)}",
+    ])
 
 
-def select_tables(project: str, dataset: str, location: str, state_key: str) -> list:
-    """Single/list/entire-dataset table picker."""
-    mode = st.radio("Input Type", ["Single Table", "List of Tables", "Entire Dataset"])
-    if mode == "Single Table":
-        table = st.text_input("Table Name", value="bq_actvn_servreq_transaction").strip()
-        return [table] if table else []
-    if mode == "List of Tables":
-        raw = st.text_input("Table Names (comma separated)", value="bq_actvn_servreq_transaction")
-        return [t.strip() for t in raw.split(",") if t.strip()]
-    if st.button("Fetch Tables from INFORMATION_SCHEMA"):
-        try:
-            st.session_state[state_key] = list_dataset_tables(project, dataset, location)
-            st.success(f"Found {len(st.session_state[state_key])} tables.")
-        except Exception as e:
-            st.error(f"Error retrieving tables: {e}")
-    return st.session_state.get(state_key, [])
-
-
-def read_target(target_path: str):
-    """(exists, text) for the output file. A read failure blocks the page —
-    proceeding with text=None would silently overwrite the file on deploy."""
-    if not os.path.exists(target_path):
-        return False, None
-    try:
-        with open(target_path, encoding="utf-8") as f:
-            return True, f.read()
-    except OSError as e:
-        st.error(f"Cannot read {target_path}: {e}")
-        st.stop()
-
-
-def show_target(environment, output_filename, target_path, file_exists, top_key):
-    st.write(f"Target file: `edemm/{environment}/governance/{output_filename}`")
-    if file_exists:
-        st.info(f"File exists — new scans append after the "
-                f"{len(read_scans(target_path, top_key))} already present.")
-
-
-def render_preview_and_deploy(existing_text, header, blocks, target_path,
-                              governance_dir, output_filename, file_exists,
-                              scan_ids=(), top_key=None):
-    """Full-file preview and gated exits. The merged text is parse-checked once
-    here and every route out — download, workspace copy, repo write — is gated
-    on that result. An existing file broken by legacy quoting or mechanical
-    whitespace is repaired in memory first, with the changes surfaced."""
-    existing_ok, existing_error, repaired, id_clash = True, "", [], []
-    if existing_text:
-        existing_ok, existing_error = check_yaml_text(existing_text)
-        if not existing_ok:
-            cand = repair_invalid_escapes(normalize_yaml_text(existing_text))
-            if cand != existing_text and check_yaml_text(cand, (), top_key)[0]:
-                repaired = [(n, o, w) for n, (o, w) in enumerate(
-                    zip(existing_text.splitlines(), cand.splitlines()), 1) if o != w]
-                existing_text, existing_ok, existing_error = cand, True, ""
-                if top_key:
-                    # While unparseable, the file's ids were invisible to
-                    # collect_repo_scan_ids; recheck to avoid duplicate keys.
-                    scans = yaml.safe_load(cand)["governance"]["consumer-governance"][top_key]["scans"]
-                    id_clash = [s for s in scan_ids if s in scans]
-
-    full_text = merge_file_text(existing_text, header, blocks) if blocks else (existing_text or "")
-    ok, err = (True, "") if not blocks else check_yaml_text(full_text, scan_ids, top_key)
-    deployable = ok and not id_clash
-
-    if blocks:
-        if id_clash:
-            st.error("Scan id(s) already present in the existing file (hidden until its "
-                     "quoting was repaired) — appending blocked: `" + "`, `".join(id_clash)
-                     + "`. Rename the affected scans or fix the repo file first.")
-        elif ok:
-            st.success(f"YAML check passed — {len(scan_ids) or len(blocks)} scan(s) "
-                       "verified present after parsing.")
-        elif not existing_ok:
-            st.error("The existing file is invalid YAML — fix it in the repo first "
-                     f"(this run's scans render fine):\n```\n{existing_error}\n```")
-        else:
-            st.error("Generated YAML failed validation — generator bug, please report:\n"
-                     f"```\n{err}\n```")
-        if repaired:
-            detail = "\n".join(f"- line {n}: `{o.strip()}` -> `{w.strip()}`"
-                               for n, o, w in repaired)
-            st.warning("Existing file auto-repaired in memory (written on deploy):\n" + detail)
-        st.text_area("File preview", value=full_text, height=420)
-        st.download_button(f"Download {output_filename}", full_text, output_filename,
-                           "text/yaml", disabled=not deployable)
-
-    st.write("### Deployment")
-    can_deploy = bool(blocks) and deployable
-    exits = (("Write to Dataplex repo", target_path,
-              f"Wrote {target_path} (+{len(blocks)} scan(s)). "
-              "Commit and push to deploy via the orchestrator."),
-             ("Save copy to workspace root",
-              os.path.join(os.path.dirname(__file__), "..", output_filename),
-              f"Saved {output_filename}."))
-    for column, (label, path, done_msg) in zip(st.columns(2), exits):
-        with column:
-            if st.button(label, disabled=not can_deploy):
-                try:
-                    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-                    with open(path, "w", encoding="utf-8", newline="\n") as f:
-                        f.write(full_text)
-                    st.success(done_msg)
-                except OSError as e:
-                    st.error(f"Write failed: {e}")
+def llm_rename_scan_ids(failing: list, forbidden: set, *, prefix: str,
+                        dataset: str, call_llm) -> dict:
+    """{table: new_id}, keeping only suggestions that pass validate_scan_id."""
+    system_instruction = (
+        "You rename BigQuery Dataplex scan job ids that violate naming rules. "
+        "Return ONLY a JSON object mapping table_name to a new job id. Every id must:\n"
+        f"1. be <= {MAX_SCAN_ID_LEN} characters;\n"
+        f"2. match ^{prefix}_[a-z0-9_]+$ (start with the literal prefix '{prefix}_');\n"
+        "3. not end with an underscore or hyphen;\n"
+        "4. not collide with the forbidden ids nor with each other.\n"
+        "Abbreviate tokens of the dataset/table name rather than inventing unrelated words.")
+    prompt = json.dumps({"dataset": dataset, "rows": failing,
+                         "forbidden_ids": sorted(forbidden)}, separators=(",", ":"))
+    data = parse_llm_json(call_llm(system_instruction, prompt))
+    if not isinstance(data, dict):
+        return {}
+    accepted, taken = {}, set(forbidden)
+    for row in failing:
+        cand = str(data.get(row["table"], "")).strip()
+        if validate_scan_id(cand, prefix, taken)[0]:
+            accepted[row["table"]] = cand
+            taken.add(cand)
+    return accepted
