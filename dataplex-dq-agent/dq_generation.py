@@ -285,9 +285,19 @@ def build_sample_evidence(rows: list, max_rows: int = _EVIDENCE_ROWS,
 # --- Optional Collibra glossary enrichment ----------------------------------------
 COLLIBRA_SECRET_PROJECT = "cto-collibra-insights-pr-2267"
 COLLIBRA_SECRET_NAME = "collibra_api_key"
-_BUSINESS_TERM_TYPE_ID = "00000000-0000-0000-0000-000000011001"  # packaged Business Term
 COLLIBRA_CSV = os.path.join(REFERENCE_DIR, "collibra_glossary.csv")
-_COLLIBRA_CSV_FIELDS = ("term", "full_name", "asset_id", "definition")
+_COLLIBRA_CSV_FIELDS = (
+    "Full Name", "Name", "Asset Id", "Asset Type", 
+    "[Business Term] has acronym [Acronym] > Name",
+    "[Business Term] has acronym [Acronym] > Full Name",
+    "[Business Term] has acronym [Acronym] > Asset Type",
+    "[Business Term] has acronym [Acronym] > Community",
+    "[Business Term] has acronym [Acronym] > Domain Type",
+    "[Business Term] has acronym [Acronym] > Domain",
+    "[Business Term] has acronym [Acronym] > Domain Id",
+    "[Business Term] has acronym [Acronym] > Asset Id",
+    "Definition", "Status", "Domain", "Community", "Domain Type", "Domain Id"
+)
 _GLOSSARY_MAX_LINES = 40
 _CONTEXT_CHAR_CAP = 80_000  # keep description prompts inside gateway limits
 _COLLIBRA_ERRORS = (GoogleAPIError, google.auth.exceptions.GoogleAuthError,
@@ -337,56 +347,6 @@ def _pick_collibra_auth(base_url: str, auth_key: str, http=requests) -> dict:
                        f"(Bearer/Basic/session): HTTP {', '.join(statuses)}")
 
 
-def fetch_collibra_glossary(base_url: str, domain_id: str, auth: dict,
-                            http=requests) -> dict:
-    """{term_lower: {id, name, full}} for every Business Term, paged 1000/call
-    until the reported total (optionally narrowed to one domain). Raises on
-    HTTP failure — the caller degrades gracefully."""
-    terms, offset, total = {}, 0, 1
-    params = {"typeIds": _BUSINESS_TERM_TYPE_ID, "limit": 1000}
-    if domain_id:
-        params["domainId"] = domain_id
-    while offset < total:
-        resp = http.get(f"{base_url.rstrip('/')}/rest/2.0/assets",
-                        params={**params, "offset": offset}, timeout=60, **auth)
-        resp.raise_for_status()
-        page = resp.json()
-        total = int(page.get("total") or 0)
-        results = page.get("results") or []
-        if not results:
-            break
-        for asset in results:
-            name = str(asset.get("name") or "")
-            if name:
-                terms[name.lower()] = {"id": str(asset.get("id") or ""), "name": name,
-                                       "full": str(asset.get("displayName") or name)}
-        offset += len(results)
-    return terms
-
-
-def fetch_collibra_definitions(base_url: str, auth: dict, asset_ids: tuple,
-                               http=requests) -> dict:
-    """{asset_id: definition text} for matched terms (capped 60); HTML stripped,
-    per-asset failures skipped."""
-    defs = {}
-    for asset_id in asset_ids[:60]:
-        try:
-            resp = http.get(f"{base_url.rstrip('/')}/rest/2.0/attributes",
-                            params={"assetId": asset_id, "limit": 20},
-                            timeout=30, **auth)
-            resp.raise_for_status()
-            for attr in resp.json().get("results") or []:
-                type_name = str((attr.get("type") or {}).get("name") or "").lower()
-                if "definition" in type_name or "description" in type_name:
-                    text = re.sub(r"<[^>]+>", " ", str(attr.get("value") or ""))
-                    defs[asset_id] = re.sub(r"\s+", " ", text).strip()
-                    break
-        except (requests.RequestException, ValueError, KeyError, TypeError) as e:
-            logger.info("collibra definition skipped for %s: %s", asset_id, e)
-            continue
-    return defs
-
-
 def _read_collibra_csv(path: str) -> list[dict]:
     """Rows of a saved glossary CSV; raises on read/parse problems."""
     with open(path, "r", encoding="utf-8", newline="") as fh:
@@ -397,22 +357,26 @@ def _read_collibra_csv(path: str) -> list[dict]:
 def save_collibra_csv(path: str, glossary: dict, defs: dict) -> None:
     """Replace the saved glossary CSV with `glossary` (one row per term, sorted).
     The definition column takes `defs[asset_id]` and falls back to the previous
-    file's value, so definitions accumulated over runs survive a refresh; terms
-    no longer in the glossary are dropped. Write failures are non-fatal (the
-    run's enrichment already succeeded): logged, old file left as-is."""
+    file's value, so definitions accumulated over runs survive a refresh."""
     try:
         carried = {}
         if os.path.exists(path):
-            carried = {r["asset_id"]: r["definition"]
-                       for r in _read_collibra_csv(path) if r["definition"]}
+            carried = {r["Asset Id"]: r["Definition"]
+                       for r in _read_collibra_csv(path) if r.get("Definition")}
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="") as fh:
             writer = csv.writer(fh)
             writer.writerow(_COLLIBRA_CSV_FIELDS)
             for term in sorted(glossary):
                 m = glossary[term]
-                writer.writerow([m["name"], m["full"], m["id"],
-                                 defs.get(m["id"]) or carried.get(m["id"], "")])
+                row_data = {f: "" for f in _COLLIBRA_CSV_FIELDS}
+                row_data["Name"] = m["name"]
+                row_data["Full Name"] = m["full"]
+                row_data["Asset Id"] = m["id"]
+                row_data["Asset Type"] = "Business Term"
+                row_data["Definition"] = defs.get(m["id"]) or carried.get(m["id"], "")
+                
+                writer.writerow([row_data[col] for col in _COLLIBRA_CSV_FIELDS])
         logger.info("collibra glossary saved: %s (%d terms)", path, len(glossary))
     except (OSError, csv.Error, KeyError, TypeError, UnicodeDecodeError) as e:
         logger.warning("collibra glossary CSV not saved (%s): %s", path, e)
@@ -421,48 +385,133 @@ def save_collibra_csv(path: str, glossary: dict, defs: dict) -> None:
 def load_collibra_csv(path: str):
     """(glossary, fetch_defs) from the saved CSV — the same contract as
     load_collibra, with definitions limited to those already saved and zero
-    Collibra traffic. Raises RuntimeError on an unreadable file; the caller
-    degrades gracefully."""
+    Collibra traffic. Raises RuntimeError on an unreadable file."""
     try:
         rows = _read_collibra_csv(path)
     except (OSError, csv.Error, UnicodeDecodeError) as e:
         raise RuntimeError(f"saved Collibra glossary unreadable ({path}): {e}") from e
-    glossary = {r["term"].lower(): {"id": r["asset_id"], "name": r["term"],
-                                    "full": r["full_name"] or r["term"]}
-                for r in rows if r["term"]}
-    defs = {r["asset_id"]: r["definition"]
-            for r in rows if r["asset_id"] and r["definition"]}
+        
+    glossary = {r["Name"].lower(): {"id": r["Asset Id"], "name": r["Name"],
+                                    "full": r["Full Name"] or r["Name"]}
+                for r in rows if r.get("Name")}
+    defs = {r["Asset Id"]: r["Definition"]
+            for r in rows if r.get("Asset Id") and r.get("Definition")}
 
     def fetch_defs(asset_ids: tuple) -> dict:
         return {a: defs[a] for a in asset_ids if defs.get(a)}
+        
     logger.info("collibra glossary loaded from CSV: %s (%d terms)", path, len(glossary))
     return glossary, fetch_defs
 
 
-def load_collibra(settings: Settings, *, get_key=get_collibra_auth_key,
+def load_collibra(settings: Settings, *, get_key=get_collibra_auth_key, 
                   http=requests, save_path: str = ""):
-    """(glossary, fetch_defs) for one run: the auth scheme is probed once and
-    held only in locals, and definitions are memoized per asset id within the
-    run — no credentials end up in any cross-run cache. With `save_path`, the
-    retrieval (and each newly fetched batch of definitions) is persisted to that
-    CSV for later offline reuse via load_collibra_csv. Raises on failure;
-    the caller degrades gracefully."""
+    """Fetches the Collibra glossary directly from the Collibra REST API v2.
+    Replicates the BigQuery join by fetching relations, assets, and attributes."""
+    
     auth = _pick_collibra_auth(settings.collibra_url, get_key(), http)
-    glossary = fetch_collibra_glossary(settings.collibra_url,
-                                       settings.collibra_domain, auth, http)
-    if save_path:
-        save_collibra_csv(save_path, glossary, {})
-    memo: dict = {}
+    base_url = settings.collibra_url.rstrip('/')
+    
+    # 1. Find the "is acronym for" Relation Type
+    resp = http.get(f"{base_url}/rest/2.0/relationTypes", timeout=30, **auth)
+    resp.raise_for_status()
+    relation_type_id = None
+    is_acronym_role = True 
+    
+    for rtype in resp.json().get("results", []):
+        if str(rtype.get("role", "")).lower() == "is acronym for":
+            relation_type_id = rtype["id"]
+            is_acronym_role = True
+            break
+        elif str(rtype.get("coRole", "")).lower() == "is acronym for":
+            relation_type_id = rtype["id"]
+            is_acronym_role = False
+            break
+            
+    if not relation_type_id:
+        raise RuntimeError("Could not find relation type 'is acronym for' in Collibra.")
 
+    # 2. Fetch all relations of this type
+    relations = []
+    offset = 0
+    while True:
+        resp = http.get(f"{base_url}/rest/2.0/relations", 
+                        params={"relationTypeId": relation_type_id, "limit": 1000, "offset": offset}, 
+                        timeout=60, **auth)
+        resp.raise_for_status()
+        page = resp.json().get("results", [])
+        if not page:
+            break
+        relations.extend(page)
+        offset += len(page)
+        
+    if not relations:
+        return {}, lambda ids: {}
+        
+    # Extract unique asset IDs to query
+    asset_ids = set()
+    term_ids = set()
+    for rel in relations:
+        asset_ids.add(rel["source"]["id"])
+        asset_ids.add(rel["target"]["id"])
+        # Track which side is the actual business term so we only fetch definitions for those
+        term_id = rel["target"]["id"] if is_acronym_role else rel["source"]["id"]
+        term_ids.add(term_id)
+        
+    # 3. Concurrently fetch Asset Names
+    asset_names = {}
+    def fetch_asset(aid):
+        r = http.get(f"{base_url}/rest/2.0/assets/{aid}", timeout=30, **auth)
+        if r.ok:
+            return aid, r.json().get("displayName") or r.json().get("name")
+        return aid, None
+        
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        for aid, name in pool.map(fetch_asset, list(asset_ids)):
+            if name:
+                asset_names[aid] = name
+                
+    # 4. Concurrently fetch Definitions for the Business Terms
+    defs = {}
+    def fetch_def(tid):
+        r = http.get(f"{base_url}/rest/2.0/attributes", 
+                     params={"assetId": tid, "limit": 20}, timeout=30, **auth)
+        if r.ok:
+            for attr in r.json().get("results", []):
+                tname = str((attr.get("type") or {}).get("name") or "").lower()
+                if "definition" in tname or "description" in tname:
+                    text = re.sub(r"<[^>]+>", " ", str(attr.get("value") or ""))
+                    return tid, re.sub(r"\s+", " ", text).strip()
+        return tid, ""
+        
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        for tid, d in pool.map(fetch_def, list(term_ids)):
+            if d:
+                defs[tid] = d
+
+    # 5. Build the expected Glossary structure
+    glossary = {}
+    for rel in relations:
+        if is_acronym_role:
+            acronym_id = rel["source"]["id"]
+            term_id = rel["target"]["id"]
+        else:
+            acronym_id = rel["target"]["id"]
+            term_id = rel["source"]["id"]
+            
+        acronym = asset_names.get(acronym_id, "")
+        business_name = asset_names.get(term_id, acronym)
+        
+        if acronym and term_id:
+            term_key = acronym.lower()
+            glossary[term_key] = {"id": term_id, "name": acronym, "full": business_name}
+            
+    if save_path:
+        save_collibra_csv(save_path, glossary, defs)
+        
     def fetch_defs(asset_ids: tuple) -> dict:
-        missing = tuple(a for a in asset_ids if a not in memo)
-        if missing:
-            found = fetch_collibra_definitions(settings.collibra_url, auth,
-                                               missing, http)
-            memo.update({a: found.get(a, "") for a in missing})
-            if save_path and found:
-                save_collibra_csv(save_path, glossary, memo)
-        return {a: memo[a] for a in asset_ids if memo.get(a)}
+        return {a: defs[a] for a in asset_ids if defs.get(a)}
+        
     return glossary, fetch_defs
 
 
@@ -631,9 +680,7 @@ def generate_descriptions(tables: list, profiles: list, tagged: dict,
                     f"SAMPLE EVIDENCE (from the last {SAMPLE_ROW_COUNT} rows):\n"
                     + (_jsonc(ev) if ev else "(no rows sampled)"))
 
-        # Glossary/reference blocks are built first and counted against the
-        # cap (they used to bypass it), then the evidence shrinks stepwise
-        # into whatever budget remains.
+        # Glossary/reference blocks are built first and counted against the cap
         extras = ""
         hint = abbrev_hint(table, *col_names, abbrev=abbrev)
         if hint:
@@ -853,15 +900,34 @@ def _num(value) -> str:
 def rule_is_valid(rule) -> bool:
     """Renderable = name + dimension + a KNOWN expectation type; unknown types
     would otherwise render as an expectation-less rule Dataplex rejects."""
-    return (isinstance(rule, dict) and bool(rule.get("name"))
+    if not (isinstance(rule, dict) and bool(rule.get("name"))
             and bool(rule.get("dimension"))
-            and (rule.get("expectation") or {}).get("type") in _EXPECTATIONS)
+            and (rule.get("expectation") or {}).get("type") in _EXPECTATIONS):
+        return False
+        
+    exp = rule.get("expectation", {})
+    etype = exp.get("type")
+    column = str(rule.get("column", "")).lower()
+    
+    # GUARDRAIL 1: Prevent set/range rules on high-cardinality ID/Name columns
+    if etype in ("set_expectation", "range_expectation"):
+        if column.endswith(("_id", "_pin", "_num", "_name", "_nm")):
+            return False
+            
+    # GUARDRAIL 2: Prevent hardcoded row counts in table conditions
+    if etype == "table_condition_expectation":
+        sql = str(exp.get("sql_expression", "")).upper()
+        # Allow COUNT(*) > 0, but block exact bounds like BETWEEN or = 
+        if "COUNT(*)" in sql and ("BETWEEN" in sql or "=" in sql):
+            return False
+
+    return True
 
 
 def _sanitize_rule(rule):
     """Coerce one LLM rule toward validity: Dataplex name charset, float
     threshold (dropped if not coercible), stripped column/dimension, list-typed
-    set values."""
+    set values. Intercepts and corrects known stubborn LLM hallucinations."""
     if not isinstance(rule, dict):
         return rule
     if rule.get("name"):
@@ -874,10 +940,19 @@ def _sanitize_rule(rule):
         rule["threshold"] = finite_float(str(rule["threshold"]).strip().rstrip("%"))
         if rule["threshold"] is None:
             del rule["threshold"]
+            
     exp = rule.get("expectation")
-    if isinstance(exp, dict) and exp.get("type") == "set_expectation":
-        values = exp.get("values")
-        exp["values"] = values if isinstance(values, list) else ([] if values is None else [values])
+    if isinstance(exp, dict):
+        if exp.get("type") == "set_expectation":
+            values = exp.get("values")
+            exp["values"] = values if isinstance(values, list) else ([] if values is None else [values])
+            
+        elif exp.get("type") == "regex_expectation":
+            # GUARDRAIL 3: Fix phone number regex if the LLM falls back to strict 10 digits
+            col = str(rule.get("column", "")).lower()
+            if "phone" in col and exp.get("regex") == "^[0-9]{10}$":
+                exp["regex"] = "^[0-9]{10,15}$"
+                
     return rule
 
 
@@ -935,7 +1010,8 @@ _SYS_PLAN = """You are an expert Google Cloud Dataplex data quality engineer.
 From the provided BigQuery column profiling data, draft a step-by-step Action Plan for a Dataplex DQ scan:
 1. Identify columns suited to non_null_expectation (COMPLETENESS), uniqueness_expectation (UNIQUENESS), range/set/regex_expectation (VALIDITY), or table-level table_condition_expectation (VOLUME/FRESHNESS).
 2. Justify each suggestion from the statistics (e.g. "range_expectation for antenna_face: values span 1-3 with no outliers"; "uniqueness_expectation for acct_id: percent_unique is 100%").
-3. Do NOT write YAML/JSON yet — analysis and justification only, in clear markdown."""
+3. DO NOT suggest `set_expectation` or `range_expectation` for high-cardinality identifiers (e.g., columns ending in `_id`, `_pin`, `_name`, or general free-text fields). Only use `set_expectation` for known low-cardinality enums or codes. DO NOT suggest hardcoded `table_condition_expectation` row counts based on current sample sizes.
+4. Do NOT write YAML/JSON yet — analysis and justification only, in clear markdown."""
 
 _SYS_RULES = """You are an expert Google Cloud Dataplex data quality engineer.
 From column profiling data, an action plan and user feedback, return ONLY one JSON object (no markdown, no prose) of this shape:
@@ -949,8 +1025,13 @@ From column profiling data, an action plan and user feedback, return ONLY one JS
 - {"type":"uniqueness_expectation"}                                      UNIQUENESS, threshold 1.0
 - {"type":"range_expectation","min_value":0,"max_value":9}               VALIDITY, threshold 0.99 (min and/or max)
 - {"type":"set_expectation","values":["A","B"],"ignore_null":true}       VALIDITY, threshold 0.99
-- {"type":"regex_expectation","regex":"^.{9}$","ignore_null":true}       VALIDITY, threshold 0.99
+- {"type":"regex_expectation","regex":"^[0-9]{10,15}$","ignore_null":true} VALIDITY, threshold 0.99
 - {"type":"table_condition_expectation","sql_expression":"COUNT(*) > 0"} VOLUME/FRESHNESS; NO column, NO threshold
+
+CRITICAL INSTRUCTIONS:
+- DO NOT apply `set_expectation` to high-cardinality entity IDs (e.g., `kb_sales_rep_pin`, `outlet_id`, `servreq_header_nm`, `sales_rep_id`, `operator_id`, `kb_dealer_cd`, `chnl_org_id`). 
+- DO NOT set hardcoded, restrictive range boundaries for sequential keys (like `servreq_header_id`) or overall table volume (avoid strictly bounding `COUNT(*)`).
+- When validating phone numbers via regex, allow reasonable variations in length (e.g., `^[0-9]{10,15}$`).
 Use table_name keys exactly as given. Only reference columns present in the profiling data. Incorporate all user feedback."""
 
 
