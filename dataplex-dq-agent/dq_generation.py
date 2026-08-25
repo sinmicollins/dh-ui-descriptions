@@ -26,7 +26,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import cast
+from typing import Any, cast
 
 import google.auth.exceptions
 import requests
@@ -405,7 +405,7 @@ def load_collibra_csv(path: str):
 
 
 def load_collibra(settings: Settings, *, get_key=get_collibra_auth_key, 
-                  http=requests, save_path: str = ""):
+                  http: Any = requests, save_path: str = ""):
     """Fetches the Collibra glossary directly from the Collibra REST API v2.
     Replicates the BigQuery join by fetching relations, assets, and attributes."""
     
@@ -887,6 +887,22 @@ _EXPECTATIONS = {
     "set_expectation", "regex_expectation", "table_condition_expectation",
 }
 
+# --- Fragile-rule guardrails: deterministic, profiling-evidence-driven -------------
+_TOP_N_CAP = 10               # Dataplex profiling returns at most 10 top-N entries;
+                              # a full list means cardinality is unknown/truncated
+_SET_COVERAGE_TOL = 1.0       # pct-points of rounding/sampling slack for coverage
+_RANGE_MAX_PERCENT_UNIQUE = 30.0  # above this a column is key-like; static bounds break
+_DEFAULT_THRESHOLD = 0.99     # column rules missing a threshold (uniqueness gets 1.0)
+_PHONE_COLUMN_HINTS = ("phone", "msisdn", "mobile")  # NOT "tel": matches telus_*
+_STRICT_PHONE_REGEXES = ("^[0-9]{10}$", r"^\d{10}$")
+_RELAXED_PHONE_REGEX = "^[0-9]{10,15}$"
+_COUNT_CMP_RE = re.compile(
+    r"\bCOUNT\s*\([^)]*\)\s*(>=|<=|<>|!=|==|=|<|>)\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+_CMP_COUNT_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(>=|<=|<>|!=|==|=|<|>)\s*COUNT\s*\(", re.IGNORECASE)
+_COUNT_BETWEEN_RE = re.compile(
+    r"\bCOUNT\s*\([^)]*\)\s*(?:NOT\s+)?BETWEEN\b", re.IGNORECASE)
+
 
 def _num(value) -> str:
     """Bare number when finite (whole floats without decimal), else a quoted
@@ -899,35 +915,20 @@ def _num(value) -> str:
 
 def rule_is_valid(rule) -> bool:
     """Renderable = name + dimension + a KNOWN expectation type; unknown types
-    would otherwise render as an expectation-less rule Dataplex rejects."""
-    if not (isinstance(rule, dict) and bool(rule.get("name"))
+    would otherwise render as an expectation-less rule Dataplex rejects.
+    Fragility policy lives in apply_rule_guardrails (reported), not here."""
+    return (isinstance(rule, dict) and bool(rule.get("name"))
             and bool(rule.get("dimension"))
-            and (rule.get("expectation") or {}).get("type") in _EXPECTATIONS):
-        return False
-        
-    exp = rule.get("expectation", {})
-    etype = exp.get("type")
-    column = str(rule.get("column", "")).lower()
-    
-    # GUARDRAIL 1: Prevent set/range rules on high-cardinality ID/Name columns
-    if etype in ("set_expectation", "range_expectation"):
-        if column.endswith(("_id", "_pin", "_num", "_name", "_nm")):
-            return False
-            
-    # GUARDRAIL 2: Prevent hardcoded row counts in table conditions
-    if etype == "table_condition_expectation":
-        sql = str(exp.get("sql_expression", "")).upper()
-        # Allow COUNT(*) > 0, but block exact bounds like BETWEEN or = 
-        if "COUNT(*)" in sql and ("BETWEEN" in sql or "=" in sql):
-            return False
-
-    return True
+            and (rule.get("expectation") or {}).get("type") in _EXPECTATIONS)
 
 
 def _sanitize_rule(rule):
-    """Coerce one LLM rule toward validity: Dataplex name charset, float
-    threshold (dropped if not coercible), stripped column/dimension, list-typed
-    set values. Intercepts and corrects known stubborn LLM hallucinations."""
+    """Coerce one LLM rule toward validity: Dataplex name charset, stripped
+    column/dimension, threshold normalized to a 0-1 ratio ("99%" and 99 both
+    become 0.99) and defaulted when missing (1.0 for uniqueness, 0.99 for other
+    column rules, removed for table conditions), list-typed set values,
+    ignore_null defaulted to true for set/regex, and the stubborn strict
+    10-digit phone regex relaxed to 10-15 digits. Mutates in place."""
     if not isinstance(rule, dict):
         return rule
     if rule.get("name"):
@@ -936,24 +937,120 @@ def _sanitize_rule(rule):
         rule["column"] = str(rule["column"]).strip()
     if rule.get("dimension") is not None:
         rule["dimension"] = str(rule["dimension"]).strip().upper()
-    if rule.get("threshold") is not None:
-        rule["threshold"] = finite_float(str(rule["threshold"]).strip().rstrip("%"))
-        if rule["threshold"] is None:
-            del rule["threshold"]
-            
     exp = rule.get("expectation")
+    etype = exp.get("type") if isinstance(exp, dict) else None
+    if rule.get("threshold") is not None:
+        t = finite_float(str(rule["threshold"]).strip().rstrip("%"))
+        if t is not None and 1.0 < t <= 100.0:
+            t /= 100.0                      # "99%" or 99 -> 0.99
+        if t is None or not 0.0 <= t <= 1.0:
+            del rule["threshold"]           # uncoercible -> defaulted below
+        else:
+            rule["threshold"] = t
+    if etype == "table_condition_expectation":
+        rule.pop("threshold", None)         # table rules carry no threshold
+    elif etype in _EXPECTATIONS and rule.get("threshold") is None:
+        rule["threshold"] = (1.0 if etype == "uniqueness_expectation"
+                             else _DEFAULT_THRESHOLD)
     if isinstance(exp, dict):
-        if exp.get("type") == "set_expectation":
+        if etype == "set_expectation":
             values = exp.get("values")
-            exp["values"] = values if isinstance(values, list) else ([] if values is None else [values])
-            
-        elif exp.get("type") == "regex_expectation":
-            # GUARDRAIL 3: Fix phone number regex if the LLM falls back to strict 10 digits
+            exp["values"] = (values if isinstance(values, list)
+                             else [] if values is None else [values])
+        if etype in ("set_expectation", "regex_expectation"):
+            exp.setdefault("ignore_null", True)
+        if etype == "regex_expectation":
             col = str(rule.get("column", "")).lower()
-            if "phone" in col and exp.get("regex") == "^[0-9]{10}$":
-                exp["regex"] = "^[0-9]{10,15}$"
-                
+            if (any(h in col for h in _PHONE_COLUMN_HINTS)
+                    and exp.get("regex") in _STRICT_PHONE_REGEXES):
+                exp["regex"] = _RELAXED_PHONE_REGEX
     return rule
+
+
+def _is_static_rowcount(sql: str) -> bool:
+    """True when any COUNT(...) in the condition is pinned to a literal other
+    than a floor of 0/1 — the fragile static-volume pattern. Handles BETWEEN,
+    both operand orders, COUNT(*)/COUNT(1)/COUNT(col)/COUNT(DISTINCT col)."""
+    if _COUNT_BETWEEN_RE.search(sql):
+        return True
+    for m in _COUNT_CMP_RE.finditer(sql):
+        op, lit = m.group(1), finite_float(m.group(2))
+        if not (lit in (0.0, 1.0) and op in (">", ">=", "!=", "<>")):
+            return True
+    for m in _CMP_COUNT_RE.finditer(sql):
+        lit, op = finite_float(m.group(1)), m.group(2)
+        if not (lit in (0.0, 1.0) and op in ("<", "<=", "!=", "<>")):
+            return True
+    return False
+
+
+def apply_rule_guardrails(rules_by_table: dict, profiles: list) -> tuple[dict, list]:
+    """(kept_by_table, dropped): deterministic fragility filter over sanitized
+    LLM rules, driven only by profiling statistics (percent scale 0-100).
+
+    - set_expectation needs positive proof of a closed domain: a profile row,
+      non-empty values, a non-empty top_n SHORTER than the profiler cap (a full
+      list means the cardinality is unknown), and — when percents are available
+      — top_n coverage of all non-null rows within _SET_COVERAGE_TOL. Set
+      VALUES are never checked against top_n (HITL may add members).
+    - range_expectation needs a profile row; dropped only on positive proof of
+      key-like cardinality (percent_unique > _RANGE_MAX_PERCENT_UNIQUE).
+    - table_condition_expectation is dropped when it pins COUNT(...) to a
+      static volume (floors of 0/1 pass; MAX(ts) freshness and SUM(CASE ...)
+      cross-column conditions are untouched).
+    Other rule types always pass. Dropped rows:
+    {"table","column","name","type","reason"} for the Step-3 report."""
+    idx = {(str(p.get("table_name")), str(p.get("column_name"))): p for p in profiles}
+    kept, dropped = {}, []
+
+    def drop(table, rule, etype, reason):
+        dropped.append({"table": table, "column": rule.get("column") or "(table)",
+                        "name": rule.get("name"), "type": etype, "reason": reason})
+
+    for table, rules in rules_by_table.items():
+        survivors = []
+        for rule in rules or []:
+            exp = rule.get("expectation") if isinstance(rule, dict) else None
+            if not isinstance(exp, dict):
+                survivors.append(rule)  # not judgeable here; rule_is_valid decides
+                continue
+            etype = exp.get("type")
+            reason = None
+            if etype == "set_expectation":
+                p = idx.get((table, str(rule.get("column"))))
+                top = (p or {}).get("top_n") or []
+                percents = [finite_float(e.get("percent")) for e in top]
+                known = [x for x in percents if x is not None]
+                pnull = finite_float((p or {}).get("percent_null"))
+                if not exp.get("values"):
+                    reason = "empty value set"
+                elif p is None:
+                    reason = "no profiling data for this column"
+                elif not top:
+                    reason = "profile has no top-N values — a closed set cannot be proven"
+                elif len(top) >= _TOP_N_CAP:
+                    reason = (f"top-N at the profiler cap ({_TOP_N_CAP}) — full value "
+                              "domain unknown (likely a high-cardinality identifier)")
+                elif (pnull is not None and len(known) == len(percents)
+                      and sum(known) < (100.0 - pnull) - _SET_COVERAGE_TOL):
+                    reason = "profiled top values do not cover all non-null rows"
+            elif etype == "range_expectation":
+                p = idx.get((table, str(rule.get("column"))))
+                punique = finite_float((p or {}).get("percent_unique"))
+                if p is None:
+                    reason = "no profiling data for this column"
+                elif punique is not None and punique > _RANGE_MAX_PERCENT_UNIQUE:
+                    reason = (f"{punique:.4g}% unique — key-like column; static "
+                              "bounds break as new values arrive")
+            elif etype == "table_condition_expectation":
+                if _is_static_rowcount(str(exp.get("sql_expression", ""))):
+                    reason = "static row-count bound pinned to the profiled volume"
+            if reason:
+                drop(table, rule, etype, reason)
+            else:
+                survivors.append(rule)
+        kept[table] = survivors
+    return kept, dropped
 
 
 def render_rule(rule: dict) -> list:
@@ -1010,8 +1107,9 @@ _SYS_PLAN = """You are an expert Google Cloud Dataplex data quality engineer.
 From the provided BigQuery column profiling data, draft a step-by-step Action Plan for a Dataplex DQ scan:
 1. Identify columns suited to non_null_expectation (COMPLETENESS), uniqueness_expectation (UNIQUENESS), range/set/regex_expectation (VALIDITY), or table-level table_condition_expectation (VOLUME/FRESHNESS).
 2. Justify each suggestion from the statistics (e.g. "range_expectation for antenna_face: values span 1-3 with no outliers"; "uniqueness_expectation for acct_id: percent_unique is 100%").
-3. DO NOT suggest `set_expectation` or `range_expectation` for high-cardinality identifiers (e.g., columns ending in `_id`, `_pin`, `_name`, or general free-text fields). Only use `set_expectation` for known low-cardinality enums or codes. DO NOT suggest hardcoded `table_condition_expectation` row counts based on current sample sizes.
-4. Do NOT write YAML/JSON yet — analysis and justification only, in clear markdown."""
+3. The profiler reports at most the 10 most frequent values per column (top_n), so a top_n list NEVER proves a closed domain by itself. Suggest set_expectation ONLY when the profile proves a small closed vocabulary: fewer than 10 top_n entries whose percentages account for all non-null rows. Entity identifiers, codes and names (reps, dealers, outlets, operators, PINs, org units, free text) often look like enums in a top_n sample — never enumerate their values; when such a column has a consistent format, suggest a format regex_expectation instead (format checks on identifiers are robust, membership checks are not). Keep format bounds tolerant of real-world variation (e.g. phone numbers: 10-15 digits, not exactly 10).
+4. Never bound key-like columns (high percent_unique, e.g. sequential ids) with range_expectation, and never pin table volume to the currently profiled row count — "COUNT(*) > 0" is the only acceptable volume condition. Prefer FRESHNESS conditions comparing MAX of an audit timestamp column to the current time, and suggest cross-column conditions where semantics imply an invariant (e.g. a create timestamp never later than the last-update timestamp).
+5. Do NOT write YAML/JSON yet — analysis and justification only, in clear markdown."""
 
 _SYS_RULES = """You are an expert Google Cloud Dataplex data quality engineer.
 From column profiling data, an action plan and user feedback, return ONLY one JSON object (no markdown, no prose) of this shape:
@@ -1029,9 +1127,11 @@ From column profiling data, an action plan and user feedback, return ONLY one JS
 - {"type":"table_condition_expectation","sql_expression":"COUNT(*) > 0"} VOLUME/FRESHNESS; NO column, NO threshold
 
 CRITICAL INSTRUCTIONS:
-- DO NOT apply `set_expectation` to high-cardinality entity IDs (e.g., `kb_sales_rep_pin`, `outlet_id`, `servreq_header_nm`, `sales_rep_id`, `operator_id`, `kb_dealer_cd`, `chnl_org_id`). 
-- DO NOT set hardcoded, restrictive range boundaries for sequential keys (like `servreq_header_id`) or overall table volume (avoid strictly bounding `COUNT(*)`).
-- When validating phone numbers via regex, allow reasonable variations in length (e.g., `^[0-9]{10,15}$`).
+- The profiler lists at most the 10 most frequent values per column (top_n), so a top_n sample never proves a closed domain. Use set_expectation ONLY when the profile shows fewer than 10 distinct values whose percentages cover all non-null rows. Never enumerate entity identifiers, codes or names (reps, dealers, outlets, operators, PINs, org units, free text) — when such a column has a consistent format, use a format regex_expectation instead.
+- Never derive range_expectation bounds from key-like columns (high percent_unique, e.g. sequential ids), and never bound COUNT(*) with the currently profiled row count — "COUNT(*) > 0" is the only acceptable volume condition.
+- For FRESHNESS, use a table_condition_expectation comparing the MAX of an audit timestamp to the current time, e.g. "CAST(MAX(load_ts) AS TIMESTAMP) > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)". Add cross-column conditions where semantics imply an invariant, e.g. "SUM(CASE WHEN last_updt_ts < create_ts THEN 1 ELSE 0 END) = 0".
+- Keep regex length bounds tolerant of real-world variation (phone numbers: "^[0-9]{10,15}$", not exactly 10).
+- Every set_expectation and regex_expectation carries "ignore_null": true; null handling belongs to non_null_expectation.
 Use table_name keys exactly as given. Only reference columns present in the profiling data. Incorporate all user feedback."""
 
 
@@ -1083,7 +1183,8 @@ def _read_upload(uploaded_file, *, notify) -> str:
 
 def generate_rules(profile_json, action_plan, hitl_feedback, *, call_llm, notify,
                    uploaded_file=None, descriptions=None):
-    """{table_name: [rule_dict, ...]} from the model; sanitized per rule."""
+    """(rules_by_table, dropped): sanitized rules that passed the
+    profiling-evidence guardrails, plus the dropped-rule report rows."""
     desc_section = _DESC_LABEL + _jsonc(descriptions) + "\n\n" if descriptions else ""
     reference = _read_upload(uploaded_file, notify=notify) or "(none provided)"
     if len(reference) > _UPLOAD_CHAR_CAP:
@@ -1109,10 +1210,18 @@ def generate_rules(profile_json, action_plan, hitl_feedback, *, call_llm, notify
     if data is None:
         raise ValueError("Model did not return JSON. Raw response:\n" + raw_text)
     tables = data.get("tables", data) if isinstance(data, dict) else {}
-    return {tbl: [_sanitize_rule(r) for r in
-                  (spec.get("rules", []) if isinstance(spec, dict)
-                   else spec if isinstance(spec, list) else [])]
-            for tbl, spec in tables.items()}
+    rules_by_table = {tbl: [_sanitize_rule(r) for r in
+                            (spec.get("rules", []) if isinstance(spec, dict)
+                             else spec if isinstance(spec, list) else [])]
+                      for tbl, spec in tables.items()}
+    kept, dropped = apply_rule_guardrails(rules_by_table, profile_json)
+    if dropped:
+        notify("warning",
+               f"{len(dropped)} suggested rule(s) dropped by the profiling-evidence "
+               "guardrails (details in the Step 3 report): "
+               + _label_list([f"{d['table']}.{d['column']} ({d['type']})"
+                              for d in dropped]))
+    return kept, dropped
 
 
 def build_scan_plan(table_order, rules_by_table, settings: Settings):

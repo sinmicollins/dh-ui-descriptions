@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import time
+from typing import Any
 
 import google.auth.exceptions
 import keyring
@@ -61,10 +62,10 @@ KNOWN_ERRORS = (
 FUELIX_API_URL = "https://api.fuelix.ai/v1/chat/completions"
 FUELIX_MODELS_URL = "https://api.fuelix.ai/v1/models"
 # Same service/username as the companion CLI so one stored key serves all tools.
-KEYRING_SERVICE = "gemma-4-saif"
+KEYRING_SERVICE = "mistral-small-3.2-24b"
 KEYRING_USERNAME = "gpt_api_key"
 FUELIX_TIMEOUT_SECONDS = 120
-DEFAULT_MODEL = "gemma-4-saif"
+DEFAULT_MODEL = "mistral-small-3.2-24b"
 _NON_CHAT_PATTERNS = ("embedding", "whisper", "transcribe", "tts", "dall-e", "imagen", "-image")
 FALLBACK_MODELS = [
    "gemma-4-saif", "gemini-2.5-flash-ca", "gemini-2.5-pro-ca", 
@@ -103,7 +104,7 @@ def get_fuelix_api_key() -> str:
 
 
 def call_fuelix(system_instruction, user_content, api_key, model, temperature=0.0,
-                *, http=requests, sleep=time.sleep) -> str:
+                *, http: Any = requests, sleep=time.sleep) -> str:
     """One chat-completions call with bounded retries for transient failures
     (429/5xx/timeouts, exponential backoff). Reasoning models reject
     non-default temperature with a 400; that case is retried once without the

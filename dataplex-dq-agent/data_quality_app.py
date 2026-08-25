@@ -214,6 +214,7 @@ if table_names and gen_descriptions:
                         st.session_state["desc_policy_tags"] = tagged
                 st.session_state.pop("action_plan", None)
                 st.session_state.pop("rules_by_table", None)
+                st.session_state.pop("dropped_rules", None)
                 xlsx_path = gen.descriptions_xlsx_path(settings)
                 if gen.save_descriptions_xlsx(xlsx_path, st.session_state["descriptions"],
                                               dataset=source_dataset_id,
@@ -244,6 +245,7 @@ if table_names:
                 st.session_state["profiles"] = profiles
                 st.session_state["table_order"] = table_names
                 st.session_state.pop("rules_by_table", None)
+                st.session_state.pop("dropped_rules", None)
                 if not profiles:
                     st.warning("No profiling data found for the selected table(s).")
                 else:
@@ -268,10 +270,12 @@ if "action_plan" in st.session_state:
     if st.button("Generate DQ Rules"):
         with st.spinner("Incorporating feedback and generating rules..."):
             try:
-                st.session_state["rules_by_table"] = gen.generate_rules(
+                rules, dropped = gen.generate_rules(
                     st.session_state["profiles"], st.session_state["action_plan"],
                     hitl_feedback, call_llm=call_llm, notify=st_notify,
                     uploaded_file=uploaded_file, descriptions=active_descriptions())
+                st.session_state["rules_by_table"] = rules
+                st.session_state["dropped_rules"] = dropped
             except dq_core.KNOWN_ERRORS as e:
                 logger.exception("rule generation failed")
                 st.error(f"Error generating rules: {e}")
@@ -285,6 +289,14 @@ if "rules_by_table" in st.session_state:
     st.caption(f"Scan-id rules: length <= {dq_core.MAX_SCAN_ID_LEN}, `^{job_prefix}_[a-z0-9_]+$`, "
                "no trailing separator, unique across the repo and this run.")
     st.dataframe(plan, width="stretch")
+    dropped = st.session_state.get("dropped_rules") or []
+    if dropped:
+        st.warning(f"{len(dropped)} suggested rule(s) were dropped by the "
+                   "profiling-evidence guardrails and are not in the YAML below — "
+                   "typically identifier-like columns whose top-N profile only "
+                   "samples the most frequent values. If one is genuinely needed, "
+                   "edit the written YAML.")
+        st.dataframe(dropped, width="stretch")
     if blocks:
         skipped = len(plan) - len(blocks)
         st.success(f"{len(blocks)} scan(s) ready." + (f" {skipped} skipped." if skipped else ""))
