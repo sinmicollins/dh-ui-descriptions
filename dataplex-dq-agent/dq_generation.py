@@ -636,12 +636,17 @@ def generate_descriptions(tables: list, profiles: list, tagged: dict,
                           fetch_rows, notify, load_glossary=None,
                           abbrev: dict | None = None,
                           existing: dict | None = None,
-                          fill_only_missing: bool = False) -> dict:
+                          fill_only_missing: bool = False,
+                          extra_context: dict | None = None) -> dict:
     """{table: {"table_description": str|None, "columns": {col: str|None}}}:
     two FuelIX calls per table grounded in the last SAMPLE_ROW_COUNT rows and
     the policy-filtered profiling stats. `existing` (already policy-nulled)
     rides along as reference context; fill_only_missing keeps it verbatim and
     generates only the gaps (fully described tables skip sampling and the LLM).
+    `extra_context` is an optional {table: str} of additional free-text blocks
+    (e.g. resolved PII categories, data domain, related tables, team/owner)
+    appended after the glossary/existing-description blocks and counted
+    against the same prompt budget — callers own its content and formatting.
     Tagged columns, blank/sentinel replies and per-table failures store null.
     All side effects are injected: `call_llm(system, user)`, `fetch_table_meta`,
     `fetch_rows(table, meta, exclude)`, `load_glossary()` and `notify`."""
@@ -704,6 +709,9 @@ def generate_descriptions(tables: list, profiles: list, tagged: dict,
             extras += ("\nEXISTING BIGQUERY DESCRIPTIONS (current metadata — "
                        "reference only, may be incomplete or outdated):\n"
                        + _jsonc(ref)[:20_000])
+        xc = (extra_context or {}).get(table)
+        if xc:
+            extras += "\n" + xc
         budget = max(_CONTEXT_CHAR_CAP - len(extras), _CONTEXT_CHAR_CAP // 4)
         context = render_context(evidence, stats_json)
         if len(context) > budget:
